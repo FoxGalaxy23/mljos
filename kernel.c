@@ -10,11 +10,18 @@ typedef int            int32_t;
 #define NULL ((void*)0)
 #endif
 
+/* === ЦВЕТОВЫЕ КОНСТАНТЫ === */
+#define COLOR_DEFAULT   0x0F /* Светло-серый на черном */
+#define COLOR_PROMPT    0x0A /* Светло-зеленый на черном */
+#define COLOR_ERROR     0x0C /* Светло-красный на черном */
+#define COLOR_ALERT     0x0E /* Желтый на черном */
+/* ========================== */
+
 /* VGA text buffer */
 volatile uint8_t *vga_buffer = (volatile uint8_t *)0xB8000;
 const int VGA_COLS = 80;
 const int VGA_ROWS = 25;
-uint8_t COLOR = 0x0F;
+uint8_t COLOR = COLOR_DEFAULT; /* Инициализация основным цветом */
 
 /* курсор */
 int cursor_row = 0;
@@ -65,7 +72,7 @@ void scroll_if_needed() {
     int r = VGA_ROWS - 1;
     for (int c = 0; c < VGA_COLS; ++c) {
         vga_buffer[(r*VGA_COLS + c) * 2] = ' ';
-        vga_buffer[(r*VGA_COLS + c) * 2 + 1] = COLOR;
+        vga_buffer[(r*VGA_COLS + c) * 2 + 1] = COLOR_DEFAULT; /* Использовать COLOR_DEFAULT для очистки */
     }
     cursor_row = VGA_ROWS - 1;
     cursor_col = 0;
@@ -116,10 +123,11 @@ void puts(const char *s) {
 void clear_screen() {
     for (int i = 0; i < VGA_COLS * VGA_ROWS; ++i) {
         vga_buffer[i*2] = ' ';
-        vga_buffer[i*2 + 1] = COLOR;
+        vga_buffer[i*2 + 1] = COLOR_DEFAULT; /* Использовать COLOR_DEFAULT для очистки */
     }
     cursor_row = 0;
     cursor_col = 0;
+    COLOR = COLOR_DEFAULT; /* Устанавливаем основной цвет */
     update_cursor();
 }
 
@@ -184,7 +192,10 @@ void get_rtc_date(uint8_t *day, uint8_t *month, uint16_t *year) {
 
 /* Промпт */
 void print_prompt() {
+    uint8_t old_color = COLOR;
+    COLOR = COLOR_PROMPT; /* Устанавливаем цвет промпта */
     puts("System : ");
+    COLOR = old_color;
 }
 
 /* Команды */
@@ -231,13 +242,19 @@ void cmd_echo(const char *rest) {
 }
 
 void cmd_reboot() {
+    uint8_t old_color = COLOR;
+    COLOR = COLOR_ALERT; /* Устанавливаем цвет предупреждения */
     puts("Rebooting...\n");
+    COLOR = old_color;
     outb(0x64, 0xFE);
     for (;;) { __asm__ volatile ("hlt"); }
 }
 
 void cmd_shutdown() {
+    uint8_t old_color = COLOR;
+    COLOR = COLOR_ALERT; /* Устанавливаем цвет предупреждения */
     puts("Shutdown...\n");
+    COLOR = old_color;
     outw(0x604, 0x2000);
     outb(0x64, 0xFE);
     for (;;) { __asm__ volatile ("hlt"); }
@@ -295,6 +312,9 @@ int read_line(char *buf, int maxlen) {
     int prompt_row = cursor_row;
     int prompt_col = cursor_col;
     history_pos = -1;
+    
+    uint8_t old_color = COLOR; /* Сохраняем цвет промпта */
+    COLOR = COLOR_DEFAULT;     /* Устанавливаем цвет ввода */
 
     update_cursor();
 
@@ -390,6 +410,7 @@ int read_line(char *buf, int maxlen) {
             putchar('\n');
             buf[len] = '\0';
             if (len > 0) push_history(buf);
+            COLOR = old_color; /* Восстанавливаем цвет для следующего промпта */
             update_cursor();
             return len;
         }
@@ -450,7 +471,13 @@ int split_args(char *line, char **argv, int maxargv) {
 
 /* handle command */
 void handle_command(char *line) {
-    if (line[0] == '\0') return;
+    uint8_t old_color = COLOR;
+    COLOR = COLOR_DEFAULT; /* Команды должны выводить результат обычным цветом */
+    
+    if (line[0] == '\0') {
+        COLOR = old_color;
+        return;
+    }
     if (starts_with(line, "time")) {
         cmd_time();
     } else if (starts_with(line, "date")) {
@@ -468,10 +495,14 @@ void handle_command(char *line) {
     } else if (starts_with(line, "help")) {
         puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
     } else {
+        COLOR = COLOR_ERROR; /* Цвет ошибки */
         puts("Unknown command: ");
         puts(line);
         putchar('\n');
+        COLOR = COLOR_DEFAULT; /* Возвращаем стандартный цвет */
     }
+    
+    COLOR = old_color;
 }
 
 /* main */
