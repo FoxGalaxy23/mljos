@@ -1,16 +1,26 @@
+/* kernel.c - mljOS (integrated) */
+
+/* базовые typedef'ы */
 typedef unsigned char  uint8_t;
 typedef unsigned short uint16_t;
 typedef unsigned int   uint32_t;
 typedef int            int32_t;
 
+#ifndef NULL
+#define NULL ((void*)0)
+#endif
+
+/* VGA text buffer */
 volatile uint8_t *vga_buffer = (volatile uint8_t *)0xB8000;
 const int VGA_COLS = 80;
 const int VGA_ROWS = 25;
-const uint8_t COLOR = 0x0F;
+uint8_t COLOR = 0x0F;
 
-static int cursor_row = 0;
-static int cursor_col = 0;
+/* курсор */
+int cursor_row = 0;
+int cursor_col = 0;
 
+/* портовые операции */
 static inline void outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
@@ -23,37 +33,63 @@ static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
 }
 
-void scroll_if_needed() {
-    if (cursor_row >= VGA_ROWS) {
-        for (int r = 1; r < VGA_ROWS; ++r) {
-            for (int c = 0; c < VGA_COLS; ++c) {
-                vga_buffer[((r-1)*VGA_COLS + c) * 2] = vga_buffer[(r*VGA_COLS + c) * 2];
-                vga_buffer[((r-1)*VGA_COLS + c) * 2 + 1] = vga_buffer[(r*VGA_COLS + c) * 2 + 1];
-            }
-        }
-        int r = VGA_ROWS - 1;
-        for (int c = 0; c < VGA_COLS; ++c) {
-            vga_buffer[(r*VGA_COLS + c) * 2] = ' ';
-            vga_buffer[(r*VGA_COLS + c) * 2 + 1] = COLOR;
-        }
-        cursor_row = VGA_ROWS - 1;
+/* простая memmove для kernel (используем для scroll) */
+static void *kmemmove(void *dst, const void *src, unsigned int n) {
+    unsigned char *d = (unsigned char*)dst;
+    const unsigned char *s = (const unsigned char*)src;
+    if (d == s) return dst;
+    if (d < s) {
+        for (unsigned int i = 0; i < n; ++i) d[i] = s[i];
+    } else {
+        for (unsigned int i = n; i-- > 0;) d[i] = s[i];
     }
+    return dst;
 }
 
+/* обновление аппаратного курсора (VGA text) */
+static inline void update_cursor() {
+    uint16_t pos = (uint16_t)(cursor_row * VGA_COLS + cursor_col);
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+/* прокрутка — копируем память вверх и очищаем последнюю строку */
+void scroll_if_needed() {
+    if (cursor_row < VGA_ROWS) return;
+    const int row_bytes = VGA_COLS * 2;
+    /* copy rows 1..VGA_ROWS-1 to 0..VGA_ROWS-2 */
+    kmemmove((void*)vga_buffer, (const void*)(vga_buffer + row_bytes), (VGA_ROWS - 1) * row_bytes);
+    /* clear last row */
+    int r = VGA_ROWS - 1;
+    for (int c = 0; c < VGA_COLS; ++c) {
+        vga_buffer[(r*VGA_COLS + c) * 2] = ' ';
+        vga_buffer[(r*VGA_COLS + c) * 2 + 1] = COLOR;
+    }
+    cursor_row = VGA_ROWS - 1;
+    cursor_col = 0;
+    update_cursor();
+}
+
+/* вывести символ на позицию */
 void putchar_at(char ch, int row, int col) {
     if (row < 0 || row >= VGA_ROWS || col < 0 || col >= VGA_COLS) return;
-    vga_buffer[(row*VGA_COLS + col) * 2] = ch;
+    vga_buffer[(row*VGA_COLS + col) * 2] = (uint8_t)ch;
     vga_buffer[(row*VGA_COLS + col) * 2 + 1] = COLOR;
 }
 
+/* putchar с обработкой спецсимволов */
 void putchar(char ch) {
     if (ch == '\n') {
         cursor_col = 0;
         cursor_row++;
         scroll_if_needed();
+        update_cursor();
         return;
     } else if (ch == '\r') {
         cursor_col = 0;
+        update_cursor();
         return;
     } else if (ch == '\t') {
         int t = 4 - (cursor_col % 4);
@@ -68,12 +104,15 @@ void putchar(char ch) {
         cursor_row++;
         scroll_if_needed();
     }
+    update_cursor();
 }
 
+/* puts */
 void puts(const char *s) {
     for (int i = 0; s[i]; ++i) putchar(s[i]);
 }
 
+/* clear screen */
 void clear_screen() {
     for (int i = 0; i < VGA_COLS * VGA_ROWS; ++i) {
         vga_buffer[i*2] = ' ';
@@ -81,39 +120,29 @@ void clear_screen() {
     }
     cursor_row = 0;
     cursor_col = 0;
+    update_cursor();
 }
-static const char scancode_map[128] = {
-    0,  27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b', /* Backspace */
-    '\t', /* Tab */
-    'q','w','e','r','t','y','u','i','o','p','[',']','\n', /* Enter */
-    0, /* Ctrl */
-    'a','s','d','f','g','h','j','k','l',';','\'','`',
-    0, /* Left shift */
-    '\\','z','x','c','v','b','n','m',',','.','/',
-    0, /* Right shift */
-    '*',
-    0, /* Alt */
-    ' ', /* Space bar */
-    0, /* CapsLock */
-    0,0,0,0,0,0,0,0,0,0, /* F1-F10 */
-    0, /* Num lock */
-    0, /* Scroll Lock */
-    0, /* Home key */
-    0, /* Up Arrow */
-    0, /* Page Up */
-    '-',
-    0, /* Left Arrow */
-    0,
-    0, /* Right Arrow */
-    '+',
-    0, /* End key */
-    0, /* Down Arrow */
-    0, /* Page Down */
-    0, /* Insert Key */
-    0, /* Delete Key */
-    0,0,0, /* F11-F12 and others */
+
+/* Scancode maps (set 1). Compiler будет дополнять нулями, если нужно. */
+static const char scancode_map_normal[128] = {
+    0, 27, '1','2','3','4','5','6','7','8','9','0','-','=', '\b',
+    '\t','q','w','e','r','t','y','u','i','o','p','[',']','\n',
+    0,'a','s','d','f','g','h','j','k','l',';','\'','`',
+    0,'\\','z','x','c','v','b','n','m',',','.','/',
+    0, '*', 0, ' ', 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 
+static const char scancode_map_shift[128] = {
+    0, 27, '!','@','#','$','%','^','&','*','(',')','_','+', '\b',
+    '\t','Q','W','E','R','T','Y','U','I','O','P','{','}','\n',
+    0,'A','S','D','F','G','H','J','K','L',':','"','~',
+    0,'|','Z','X','C','V','B','N','M','<','>','?',
+    0, '*', 0, ' ', 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+};
+
+/* RTC helpers */
 static inline uint8_t bcd_to_bin(uint8_t val) {
     return (val & 0x0F) + ((val >> 4) * 10);
 }
@@ -153,10 +182,12 @@ void get_rtc_date(uint8_t *day, uint8_t *month, uint16_t *year) {
     *year = 2000 + (uint16_t)y;
 }
 
+/* Промпт */
 void print_prompt() {
     puts("System : ");
 }
 
+/* Команды */
 void cmd_time() {
     uint8_t h,m,s;
     get_rtc_time(&h,&m,&s);
@@ -212,6 +243,7 @@ void cmd_shutdown() {
     for (;;) { __asm__ volatile ("hlt"); }
 }
 
+/* простая starts_with */
 int starts_with(const char *s, const char *prefix) {
     int i = 0;
     while (prefix[i]) {
@@ -221,48 +253,202 @@ int starts_with(const char *s, const char *prefix) {
     return 1;
 }
 
+/* История и ввод: реализация read_line с поддержкой shift/caps/history */
+#define HISTORY_SIZE 16
+static char history[HISTORY_SIZE][128];
+static int history_count = 0;
+static int history_pos = -1;
+
+static void push_history(const char *line) {
+    if (!line || !line[0]) return;
+    int idx = history_count % HISTORY_SIZE;
+    /* strncpy-like */
+    int i;
+    for (i = 0; i < 127 && line[i]; ++i) history[idx][i] = line[i];
+    history[idx][i] = '\0';
+    history_count++;
+}
+
+static const char* history_get(int pos_from_latest) {
+    if (history_count == 0) return NULL;
+    if (pos_from_latest < 0) return NULL;
+    int avail = history_count < HISTORY_SIZE ? history_count : HISTORY_SIZE;
+    if (pos_from_latest >= avail) return NULL;
+    int idx = (history_count - 1 - pos_from_latest) % HISTORY_SIZE;
+    if (idx < 0) idx += HISTORY_SIZE;
+    return history[idx];
+}
+
+/* Визуальная очистка ввода от prompt_col до конца строки (простая версия) */
+static void clear_input_visual(int prompt_row, int prompt_col) {
+    for (int c = prompt_col; c < VGA_COLS; ++c) {
+        putchar_at(' ', prompt_row, c);
+    }
+    cursor_row = prompt_row;
+    cursor_col = prompt_col;
+    update_cursor();
+}
+
+/* read_line: улучшенная, блокирующая, с поллингом PS/2, поддержкой истории */
 int read_line(char *buf, int maxlen) {
     int len = 0;
+    int prompt_row = cursor_row;
+    int prompt_col = cursor_col;
+    history_pos = -1;
+
+    update_cursor();
+
+    int shift_down = 0;
+    int capslock = 0;
+
     while (1) {
-        while (!(inb(0x64) & 1)) {
-            __asm__ volatile ("nop");
-        }
+        while (!(inb(0x64) & 1)) { __asm__ volatile ("nop"); }
         uint8_t sc = inb(0x60);
 
+        /* Shift press/release */
+        if (sc == 0x2A || sc == 0x36) { shift_down = 1; continue; }
+        if (sc == 0xAA || sc == 0xB6) { shift_down = 0; continue; }
+        /* CapsLock */
+        if (sc == 0x3A) { capslock = !capslock; continue; }
+
+        /* Up/Down/Left/Right (basic) */
+        if (sc == 0x48) { /* Up */
+            if (history_count == 0) continue;
+            if (history_pos < 0) history_pos = 0;
+            else if (history_pos < HISTORY_SIZE - 1) history_pos++;
+            const char *h = history_get(history_pos);
+            if (h) {
+                clear_input_visual(prompt_row, prompt_col);
+                int i = 0;
+                while (h[i] && i < maxlen - 1) {
+                    buf[i] = h[i];
+                    putchar_at(h[i], cursor_row, cursor_col++);
+                    if (cursor_col >= VGA_COLS) { cursor_col = 0; cursor_row++; scroll_if_needed(); }
+                    i++;
+                }
+                len = i; buf[len] = '\0';
+                update_cursor();
+            }
+            continue;
+        } else if (sc == 0x50) { /* Down */
+            if (history_count == 0) continue;
+            if (history_pos <= 0) {
+                history_pos = -1;
+                clear_input_visual(prompt_row, prompt_col);
+                len = 0; buf[0] = '\0';
+            } else {
+                history_pos--;
+                const char *h = history_get(history_pos);
+                if (h) {
+                    clear_input_visual(prompt_row, prompt_col);
+                    int i = 0;
+                    while (h[i] && i < maxlen - 1) {
+                        buf[i] = h[i];
+                        putchar_at(h[i], cursor_row, cursor_col++);
+                        if (cursor_col >= VGA_COLS) { cursor_col = 0; cursor_row++; scroll_if_needed(); }
+                        i++;
+                    }
+                    len = i; buf[len] = '\0';
+                    update_cursor();
+                }
+            }
+            continue;
+        } else if (sc == 0x4B) { /* Left */
+            if (len > 0) {
+                if (cursor_col == 0) {
+                    if (cursor_row > 0) { cursor_row--; cursor_col = VGA_COLS - 1; }
+                    else cursor_col = 0;
+                } else cursor_col--;
+                update_cursor();
+            }
+            continue;
+        } else if (sc == 0x4D) { /* Right */
+            if (len < maxlen - 1) {
+                if (cursor_col == VGA_COLS - 1) { cursor_col = 0; cursor_row++; scroll_if_needed(); }
+                else cursor_col++;
+                update_cursor();
+            }
+            continue;
+        }
+
+        /* ignore releases */
         if (sc & 0x80) continue;
 
+        /* map scancode -> char */
         char c = 0;
-        if (sc < 128) c = scancode_map[sc];
+        if (sc < 128) {
+            int is_letter = 0;
+            if ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) || (sc >= 0x2C && sc <= 0x32)) is_letter = 1;
+            int use_shift_map = shift_down;
+            if (capslock && is_letter) use_shift_map = !use_shift_map;
+            c = use_shift_map ? scancode_map_shift[sc] : scancode_map_normal[sc];
+        }
         if (c == 0) continue;
 
+        /* Enter */
         if (c == '\n' || c == '\r') {
             putchar('\n');
             buf[len] = '\0';
+            if (len > 0) push_history(buf);
+            update_cursor();
             return len;
-        } else if (c == '\b') {
+        }
+
+        /* Backspace */
+        if (c == '\b') {
             if (len > 0) {
                 if (cursor_col == 0) {
-                    if (cursor_row > 0) {
-                        cursor_row--;
-                        cursor_col = VGA_COLS - 1;
-                    } else {
-                        cursor_col = 0;
-                    }
-                } else {
-                    cursor_col--;
-                }
+                    if (cursor_row > 0) { cursor_row--; cursor_col = VGA_COLS - 1; }
+                    else cursor_col = 0;
+                } else cursor_col--;
                 putchar_at(' ', cursor_row, cursor_col);
-                len--;
+                len--; buf[len] = '\0';
+                update_cursor();
             }
-        } else {
-            if (len < maxlen - 1) {
-                buf[len++] = c;
-                putchar(c);
+            continue;
+        }
+
+        /* Tab: 4 spaces */
+        if (c == '\t') {
+            int t = 4 - (len % 4);
+            while (t-- && len < maxlen - 1) {
+                buf[len++] = ' ';
+                putchar_at(' ', cursor_row, cursor_col);
+                cursor_col++;
+                if (cursor_col >= VGA_COLS) { cursor_col = 0; cursor_row++; scroll_if_needed(); }
             }
+            buf[len] = '\0';
+            update_cursor();
+            continue;
+        }
+
+        /* обычный символ */
+        if (len < maxlen - 1) {
+            buf[len++] = c;
+            putchar_at(c, cursor_row, cursor_col);
+            cursor_col++;
+            if (cursor_col >= VGA_COLS) { cursor_col = 0; cursor_row++; scroll_if_needed(); }
+            buf[len] = '\0';
+            update_cursor();
         }
     }
 }
 
+/* простая парсер-функция: разделяем строку по пробелам */
+int split_args(char *line, char **argv, int maxargv) {
+    int argc = 0;
+    char *p = line;
+    while (*p && argc < maxargv) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        argv[argc++] = p;
+        while (*p && *p != ' ') p++;
+        if (*p) { *p = '\0'; p++; }
+    }
+    return argc;
+}
+
+/* handle command */
 void handle_command(char *line) {
     if (line[0] == '\0') return;
     if (starts_with(line, "time")) {
@@ -279,6 +465,8 @@ void handle_command(char *line) {
         cmd_shutdown();
     } else if (starts_with(line, "clear")) {
         clear_screen();
+    } else if (starts_with(line, "help")) {
+        puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
     } else {
         puts("Unknown command: ");
         puts(line);
@@ -286,10 +474,11 @@ void handle_command(char *line) {
     }
 }
 
+/* main */
 void kernel_main() {
     clear_screen();
     puts("Welcome to mljOS by foxgalaxy23\n");
-    puts("Commands: time, date, echo, shutdown, reboot, clear\n\n");
+    puts("Commands: time, date, echo, shutdown, reboot, clear, help\n\n");
 
     char linebuf[128];
     while (1) {
