@@ -190,11 +190,201 @@ void get_rtc_date(uint8_t *day, uint8_t *month, uint16_t *year) {
     *year = 2000 + (uint16_t)y;
 }
 
+/* ==================== СТРОКОВЫЕ ФУНКЦИИ ==================== */
+int strcmp(const char *s1, const char *s2) {
+    while (*s1 && (*s1 == *s2)) { s1++; s2++; }
+    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+}
+char *strcpy(char *dest, const char *src) {
+    char *d = dest;
+    while ((*d++ = *src++));
+    return dest;
+}
+unsigned int strlen(const char *s) {
+    unsigned int len = 0;
+    while (s[len]) len++;
+    return len;
+}
+char *strncpy(char *dest, const char *src, unsigned int n) {
+    unsigned int i;
+    for (i = 0; i < n && src[i] != '\0'; i++) dest[i] = src[i];
+    for ( ; i < n; i++) dest[i] = '\0';
+    return dest;
+}
+
+/* ======================== RamFS ============================ */
+#define FS_FILE 0
+#define FS_DIR  1
+#define MAX_FS_NODES 256
+#define FS_POOL_SIZE (64 * 1024)
+
+typedef struct fs_node {
+    char name[32];
+    uint8_t flags;
+    uint32_t size;
+    struct fs_node *parent;
+    struct fs_node *child;
+    struct fs_node *sibling;
+    char *content;
+} fs_node_t;
+
+fs_node_t fs_nodes[MAX_FS_NODES];
+int fs_node_count = 0;
+char fs_data_pool[FS_POOL_SIZE];
+int fs_data_offset = 0;
+fs_node_t *fs_root = NULL;
+fs_node_t *current_dir = NULL;
+
+void fs_init() {
+    fs_root = &fs_nodes[fs_node_count++];
+    strcpy(fs_root->name, "/");
+    fs_root->flags = FS_DIR;
+    fs_root->parent = fs_root;
+    current_dir = fs_root;
+}
+
+fs_node_t *fs_find_child(fs_node_t *dir, const char *name) {
+    if (!dir || dir->flags != FS_DIR) return NULL;
+    if (strcmp(name, ".") == 0) return dir;
+    if (strcmp(name, "..") == 0) return dir->parent;
+    
+    fs_node_t *curr = dir->child;
+    while (curr) {
+        if (strcmp(curr->name, name) == 0) return curr;
+        curr = curr->sibling;
+    }
+    return NULL;
+}
+
+fs_node_t *fs_create_node(fs_node_t *dir, const char *name, uint8_t flags) {
+    if (fs_node_count >= MAX_FS_NODES) return NULL;
+    if (fs_find_child(dir, name)) return NULL;
+    
+    fs_node_t *new_node = &fs_nodes[fs_node_count++];
+    strncpy(new_node->name, name, 31);
+    new_node->name[31] = '\0';
+    new_node->flags = flags;
+    new_node->parent = dir;
+    new_node->child = NULL;
+    new_node->sibling = dir->child;
+    dir->child = new_node;
+    new_node->size = 0;
+    new_node->content = NULL;
+    return new_node;
+}
+
+void fs_delete_node(fs_node_t *dir, const char *name) {
+    if (!dir || dir->flags != FS_DIR) return;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return;
+    
+    fs_node_t *prev = NULL;
+    fs_node_t *curr = dir->child;
+    while (curr) {
+        if (strcmp(curr->name, name) == 0) {
+            if (prev) prev->sibling = curr->sibling;
+            else dir->child = curr->sibling;
+            return;
+        }
+        prev = curr;
+        curr = curr->sibling;
+    }
+}
+
+void cmd_ls() {
+    if (!current_dir) return;
+    fs_node_t *curr = current_dir->child;
+    while (curr) {
+        uint8_t old_color = COLOR;
+        if (curr->flags == FS_DIR) COLOR = 0x09;
+        else COLOR = COLOR_DEFAULT;
+        
+        puts(curr->name);
+        puts("  ");
+        COLOR = old_color;
+        curr = curr->sibling;
+    }
+    putchar('\n');
+}
+
+void cmd_cd(const char *path) {
+    if (!path || !path[0]) return;
+    if (strcmp(path, "/") == 0) { current_dir = fs_root; return; }
+    fs_node_t *target = fs_find_child(current_dir, path);
+    if (!target) puts("cd: no such file or directory\n");
+    else if (target->flags != FS_DIR) puts("cd: not a directory\n");
+    else current_dir = target;
+}
+
+void cmd_mkdir(const char *name) {
+    if (!fs_create_node(current_dir, name, FS_DIR)) puts("mkdir: cannot create directory\n");
+}
+
+void cmd_touch(const char *name) {
+    if (!fs_create_node(current_dir, name, FS_FILE)) puts("touch: cannot create file\n");
+}
+
+void cmd_rm(const char *name) {
+    fs_delete_node(current_dir, name);
+}
+
+void cmd_cat(const char *name) {
+    fs_node_t *file = fs_find_child(current_dir, name);
+    if (!file) puts("cat: no such file\n");
+    else if (file->flags != FS_FILE) puts("cat: is a directory\n");
+    else {
+        if (file->size > 0 && file->content) {
+            for (uint32_t i = 0; i < file->size; i++) putchar(file->content[i]);
+        }
+        putchar('\n');
+    }
+}
+
+void cmd_write(const char *name, const char *text) {
+    fs_node_t *file = fs_find_child(current_dir, name);
+    if (!file) {
+        file = fs_create_node(current_dir, name, FS_FILE);
+        if (!file) { puts("write: cannot create file\n"); return; }
+    }
+    if (file->flags != FS_FILE) { puts("write: is a directory\n"); return; }
+    
+    unsigned int len = strlen(text);
+    if (fs_data_offset + len > FS_POOL_SIZE) { puts("write: out of space\n"); return; }
+    
+    file->content = &fs_data_pool[fs_data_offset];
+    for (unsigned int i = 0; i < len; i++) file->content[i] = text[i];
+    file->size = len;
+    fs_data_offset += len;
+}
+
+void cmd_cp(const char *src_name, const char *dst_name) {
+    fs_node_t *src = fs_find_child(current_dir, src_name);
+    if (!src) { puts("cp: no such file\n"); return; }
+    if (src->flags == FS_DIR) { puts("cp: omitting directory\n"); return; }
+    
+    fs_node_t *dst = fs_create_node(current_dir, dst_name, FS_FILE);
+    if (!dst) { puts("cp: cannot create destination\n"); return; }
+    
+    if (src->size > 0 && src->content) {
+        if (fs_data_offset + src->size > FS_POOL_SIZE) { puts("cp: out of space\n"); return; }
+        dst->content = &fs_data_pool[fs_data_offset];
+        for (uint32_t i = 0; i < src->size; i++) dst->content[i] = src->content[i];
+        dst->size = src->size;
+        fs_data_offset += src->size;
+    }
+}
+
 /* Промпт */
 void print_prompt() {
     uint8_t old_color = COLOR;
     COLOR = COLOR_PROMPT; /* Устанавливаем цвет промпта */
-    puts("System : ");
+    puts("root@mljOS:");
+    if (current_dir) {
+        if (strcmp(current_dir->name, "/") == 0) puts("/");
+        else puts(current_dir->name);
+    } else {
+        puts("/");
+    }
+    puts("# ");
     COLOR = old_color;
 }
 
@@ -260,15 +450,7 @@ void cmd_shutdown() {
     for (;;) { __asm__ volatile ("hlt"); }
 }
 
-/* простая starts_with */
-int starts_with(const char *s, const char *prefix) {
-    int i = 0;
-    while (prefix[i]) {
-        if (s[i] == '\0' || s[i] != prefix[i]) return 0;
-        i++;
-    }
-    return 1;
-}
+
 
 /* История и ввод: реализация read_line с поддержкой shift/caps/history */
 #define HISTORY_SIZE 16
@@ -478,26 +660,66 @@ void handle_command(char *line) {
         COLOR = old_color;
         return;
     }
-    if (starts_with(line, "time")) {
+    
+    char line_copy[128];
+    strcpy(line_copy, line);
+    
+    char *argv[10];
+    int argc = split_args(line_copy, argv, 10);
+    if (argc == 0) {
+        COLOR = old_color;
+        return;
+    }
+
+    if (strcmp(argv[0], "time") == 0) {
         cmd_time();
-    } else if (starts_with(line, "date")) {
+    } else if (strcmp(argv[0], "date") == 0) {
         cmd_date();
-    } else if (starts_with(line, "echo ")) {
-        cmd_echo(line + 5);
-    } else if (starts_with(line, "echo")) {
-        cmd_echo("");
-    } else if (starts_with(line, "reboot")) {
+    } else if (strcmp(argv[0], "echo") == 0) {
+        if (argc > 1) {
+            int offset = (argv[1] - line_copy);
+            cmd_echo(line + offset);
+        } else {
+            cmd_echo("");
+        }
+    } else if (strcmp(argv[0], "reboot") == 0) {
         cmd_reboot();
-    } else if (starts_with(line, "shutdown")) {
+    } else if (strcmp(argv[0], "shutdown") == 0) {
         cmd_shutdown();
-    } else if (starts_with(line, "clear")) {
+    } else if (strcmp(argv[0], "clear") == 0) {
         clear_screen();
-    } else if (starts_with(line, "help")) {
+    } else if (strcmp(argv[0], "ls") == 0) {
+        cmd_ls();
+    } else if (strcmp(argv[0], "cd") == 0) {
+        if (argc > 1) cmd_cd(argv[1]);
+        else puts("cd: missing operand\n");
+    } else if (strcmp(argv[0], "mkdir") == 0) {
+        if (argc > 1) cmd_mkdir(argv[1]);
+        else puts("mkdir: missing operand\n");
+    } else if (strcmp(argv[0], "touch") == 0) {
+        if (argc > 1) cmd_touch(argv[1]);
+        else puts("touch: missing operand\n");
+    } else if (strcmp(argv[0], "rm") == 0) {
+        if (argc > 1) cmd_rm(argv[1]);
+        else puts("rm: missing operand\n");
+    } else if (strcmp(argv[0], "cat") == 0) {
+        if (argc > 1) cmd_cat(argv[1]);
+        else puts("cat: missing operand\n");
+    } else if (strcmp(argv[0], "cp") == 0) {
+        if (argc > 2) cmd_cp(argv[1], argv[2]);
+        else puts("cp: missing operands\n");
+    } else if (strcmp(argv[0], "write") == 0) {
+        if (argc > 2) {
+            int offset = (argv[2] - line_copy);
+            cmd_write(argv[1], line + offset);
+        } else puts("write: missing file or text\n");
+    } else if (strcmp(argv[0], "help") == 0) {
         puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
+        puts("FS: ls, cd, mkdir, touch, rm, cat, cp, write\n");
     } else {
         COLOR = COLOR_ERROR; /* Цвет ошибки */
         puts("Unknown command: ");
-        puts(line);
+        puts(argv[0]);
         putchar('\n');
         COLOR = COLOR_DEFAULT; /* Возвращаем стандартный цвет */
     }
@@ -507,9 +729,11 @@ void handle_command(char *line) {
 
 /* main */
 void kernel_main() {
+    fs_init();
     clear_screen();
     puts("Welcome to mljOS by foxgalaxy23\n");
-    puts("Commands: time, date, echo, shutdown, reboot, clear, help\n\n");
+    puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
+    puts("FS Commands: ls, cd, mkdir, touch, rm, cat, cp, write\n\n");
 
     char linebuf[128];
     while (1) {
