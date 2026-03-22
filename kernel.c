@@ -39,6 +39,11 @@ static inline uint8_t inb(uint16_t port) {
 static inline void outw(uint16_t port, uint16_t val) {
     __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
 }
+static inline uint16_t inw(uint16_t port) {
+    uint16_t ret;
+    __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
 
 /* простая memmove для kernel (используем для scroll) */
 static void *kmemmove(void *dst, const void *src, unsigned int n) {
@@ -372,6 +377,163 @@ void cmd_cp(const char *src_name, const char *dst_name) {
         fs_data_offset += src->size;
     }
 }
+
+/* ================== ATA PIO & SDFS ========================= */
+static void ata_wait_bsy() { while (inb(0x1F7) & 0x80); }
+static void ata_wait_drq() { while (!(inb(0x1F7) & 0x08)); }
+
+void ata_read_sector(uint32_t lba, uint8_t *buffer) {
+    ata_wait_bsy();
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, (uint8_t) lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    outb(0x1F7, 0x20); // READ
+    ata_wait_bsy();
+    ata_wait_drq();
+    for (int i = 0; i < 256; i++) {
+        uint16_t data = inw(0x1F0);
+        buffer[i*2] = (uint8_t)(data & 0xFF);
+        buffer[i*2+1] = (uint8_t)(data >> 8);
+    }
+}
+
+void ata_write_sector(uint32_t lba, const uint8_t *buffer) {
+    ata_wait_bsy();
+    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    outb(0x1F2, 1);
+    outb(0x1F3, (uint8_t) lba);
+    outb(0x1F4, (uint8_t)(lba >> 8));
+    outb(0x1F5, (uint8_t)(lba >> 16));
+    outb(0x1F7, 0x30); // WRITE
+    ata_wait_bsy();
+    ata_wait_drq();
+    for (int i = 0; i < 256; i++) {
+        uint16_t data = buffer[i*2] | (buffer[i*2+1] << 8);
+        outw(0x1F0, data);
+    }
+    // Flush cache
+    outb(0x1F7, 0xE7);
+    ata_wait_bsy();
+}
+
+#define SDFS_MAGIC 0x5DF50001
+typedef struct {
+    char name[24];
+    uint32_t lba;
+    uint32_t size;
+} sdfs_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t next_free_lba;
+    sdfs_entry_t entries[15];
+} sdfs_header_t;
+
+void cmd_disk_format() {
+    uint8_t buf[512] = {0};
+    sdfs_header_t *hdr = (sdfs_header_t*)buf;
+    hdr->magic = SDFS_MAGIC;
+    hdr->next_free_lba = 1; // 0 is superblock
+    ata_write_sector(0, buf);
+    puts("Disk formatted securely (SDFS).\n");
+}
+
+void cmd_disk_ls() {
+    uint8_t buf[512];
+    ata_read_sector(0, buf);
+    sdfs_header_t *hdr = (sdfs_header_t*)buf;
+    if (hdr->magic != SDFS_MAGIC) {
+        puts("Disk not formatted. Use 'disk format'.\n");
+        return;
+    }
+    for (int i=0; i<15; i++) {
+        if (hdr->entries[i].name[0] != '\0') {
+            puts(hdr->entries[i].name);
+            puts("  ");
+        }
+    }
+    putchar('\n');
+}
+
+void cmd_disk_write(const char *name, const char *text) {
+    if (!name || !text) return;
+    uint8_t buf[512];
+    ata_read_sector(0, buf);
+    sdfs_header_t *hdr = (sdfs_header_t*)buf;
+    if (hdr->magic != SDFS_MAGIC) { puts("Disk not formatted.\n"); return; }
+    
+    // Find empty entry or overwrite
+    int entry_idx = -1;
+    for (int i=0; i<15; i++) {
+        if (hdr->entries[i].name[0] == '\0') {
+            if (entry_idx == -1) entry_idx = i;
+        } else if (strcmp(hdr->entries[i].name, name) == 0) {
+            entry_idx = i; break;
+        }
+    }
+    if (entry_idx == -1) { puts("Disk root full (MAX 15).\n"); return; }
+    
+    uint32_t target_lba = hdr->next_free_lba;
+    if (hdr->entries[entry_idx].name[0] != '\0') {
+        target_lba = hdr->entries[entry_idx].lba; // Reuse block
+    } else {
+        hdr->next_free_lba++;
+    }
+    
+    strncpy(hdr->entries[entry_idx].name, name, 23);
+    hdr->entries[entry_idx].name[23] = '\0';
+    hdr->entries[entry_idx].lba = target_lba;
+    
+    unsigned int len = strlen(text);
+    if (len > 512) len = 512;
+    hdr->entries[entry_idx].size = len;
+    
+    uint8_t data_buf[512] = {0};
+    for (unsigned int i=0; i<len; i++) data_buf[i] = text[i];
+    
+    ata_write_sector(target_lba, data_buf);
+    ata_write_sector(0, buf);
+}
+
+void cmd_disk_cat(const char *name) {
+    uint8_t buf[512];
+    ata_read_sector(0, buf);
+    sdfs_header_t *hdr = (sdfs_header_t*)buf;
+    if (hdr->magic != SDFS_MAGIC) { puts("Disk not formatted.\n"); return; }
+    
+    for (int i=0; i<15; i++) {
+        if (strcmp(hdr->entries[i].name, name) == 0) {
+            uint8_t data_buf[512];
+            ata_read_sector(hdr->entries[i].lba, data_buf);
+            for (uint32_t j=0; j<hdr->entries[i].size; j++) {
+                putchar((char)data_buf[j]);
+            }
+            putchar('\n');
+            return;
+        }
+    }
+    puts("File not found on disk.\n");
+}
+
+void cmd_disk_rm(const char *name) {
+    uint8_t buf[512];
+    ata_read_sector(0, buf);
+    sdfs_header_t *hdr = (sdfs_header_t*)buf;
+    if (hdr->magic != SDFS_MAGIC) return;
+    
+    for (int i=0; i<15; i++) {
+        if (strcmp(hdr->entries[i].name, name) == 0) {
+            hdr->entries[i].name[0] = '\0';
+            ata_write_sector(0, buf);
+            return;
+        }
+    }
+    puts("File not found.\n");
+}
+
+/* =========================================================== */
 
 /* Промпт */
 void print_prompt() {
@@ -713,6 +875,24 @@ void handle_command(char *line) {
             int offset = (argv[2] - line_copy);
             cmd_write(argv[1], line + offset);
         } else puts("write: missing file or text\n");
+    } else if (strcmp(argv[0], "disk") == 0) {
+        if (argc < 2) { puts("disk: missing command (format, ls, write, cat, rm)\n"); }
+        else if (strcmp(argv[1], "format") == 0) cmd_disk_format();
+        else if (strcmp(argv[1], "ls") == 0) cmd_disk_ls();
+        else if (strcmp(argv[1], "rm") == 0) {
+            if (argc > 2) cmd_disk_rm(argv[2]);
+            else puts("disk rm: missing file name\n");
+        }
+        else if (strcmp(argv[1], "cat") == 0) {
+            if (argc > 2) cmd_disk_cat(argv[2]);
+            else puts("disk cat: missing file name\n");
+        }
+        else if (strcmp(argv[1], "write") == 0) {
+            if (argc > 3) {
+                int offset = (argv[3] - line_copy);
+                cmd_disk_write(argv[2], line + offset);
+            } else puts("disk write: missing file or text\n");
+        } else { puts("disk: unknown command\n"); }
     } else if (strcmp(argv[0], "help") == 0) {
         puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
         puts("FS: ls, cd, mkdir, touch, rm, cat, cp, write\n");
@@ -733,7 +913,8 @@ void kernel_main() {
     clear_screen();
     puts("Welcome to mljOS by foxgalaxy23\n");
     puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
-    puts("FS Commands: ls, cd, mkdir, touch, rm, cat, cp, write\n\n");
+    puts("FS Commands: ls, cd, mkdir, touch, rm, cat, cp, write\n");
+    puts("Disk SDFS: disk format, disk ls, disk cat, disk write, disk rm\n\n");
 
     char linebuf[128];
     while (1) {
