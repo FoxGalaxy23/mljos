@@ -26,16 +26,23 @@ fi
 
 echo "Compiling Micro OS..."
 
-# Compile C kernel
-i686-linux-gnu-gcc -m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector -c kernel.c -o kernel.o
-if [ $? -ne 0 ]; then echo "Failed to compile kernel.c"; exit 1; fi
+# Compile C sources
+C_SOURCES="kernel.c console.c kstring.c rtc.c fs.c disk.c shell.c"
+OBJECTS=""
+
+for src in $C_SOURCES; do
+    obj="${src%.c}.o"
+    i686-linux-gnu-gcc -m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector -c "$src" -o "$obj"
+    if [ $? -ne 0 ]; then echo "Failed to compile $src"; exit 1; fi
+    OBJECTS="$OBJECTS $obj"
+done
 
 # Assemble bootloader
 nasm -f elf32 boot.asm -o boot.o
 if [ $? -ne 0 ]; then echo "Failed to assemble boot.asm"; exit 1; fi
 
 # Link
-i686-linux-gnu-ld -m elf_i386 -T linker.ld boot.o kernel.o -o mljos.bin
+i686-linux-gnu-ld -m elf_i386 -T linker.ld boot.o $OBJECTS -o mljos.bin
 if [ $? -ne 0 ]; then echo "Failed to link object files"; exit 1; fi
 
 # Prepare ISO structure
@@ -47,6 +54,6 @@ grub-mkrescue -o mljOS.iso isodir
 if [ $? -ne 0 ]; then echo "Failed to create ISO"; exit 1; fi
 
 echo "Cleaning up temporary files..."
-rm -f kernel.o boot.o isodir/boot/mljos.bin mljos.bin
+rm -f $OBJECTS boot.o isodir/boot/mljos.bin mljos.bin
 
 echo "Build successful! Created mljOS.iso"
