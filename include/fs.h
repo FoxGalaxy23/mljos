@@ -5,6 +5,7 @@
 
 #define FS_FILE 0
 #define FS_DIR  1
+#define FS_APP_DIR "/apps"
 
 #define FS_PERM_READ  4
 #define FS_PERM_WRITE 2
@@ -48,6 +49,8 @@ void cmd_cp(const char *src_path, const char *dst_path);
 void cmd_chmod(const char *mode_text, const char *path);
 void cmd_chown(const char *owner_name, const char *path);
 void cmd_ram_exec(const char *path);
+int fs_resolve_app_command(const char *name, char *out, int out_size);
+int fs_can_exec_path(const char *path);
 int fs_read_file(const char *path, char *out, int maxlen, uint32_t *size_out);
 int fs_write_file(const char *path, const char *data, uint32_t size);
 

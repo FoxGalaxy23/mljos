@@ -55,6 +55,17 @@ static void copy_limited(char *dst, const char *src, int maxlen) {
     dst[i] = '\0';
 }
 
+static int ends_with(const char *text, const char *suffix) {
+    int text_len;
+    int suffix_len;
+
+    if (!text || !suffix) return 0;
+    text_len = strlen(text);
+    suffix_len = strlen(suffix);
+    if (suffix_len > text_len) return 0;
+    return strcmp(text + text_len - suffix_len, suffix) == 0;
+}
+
 static int path_has_more(const char *path, int index) {
     while (path[index] == '/') index++;
     return path[index] != '\0';
@@ -396,6 +407,7 @@ int fs_sync_to_disk(void) {
 }
 
 void fs_init(void) {
+    fs_node_t *apps_dir;
     fs_node_t *calc;
     fs_node_t *edit;
 
@@ -416,13 +428,15 @@ void fs_init(void) {
     fs_root->content = NULL;
     current_dir = fs_root;
 
-    calc = fs_create_node(fs_root, "calc.app", FS_FILE, 0, 0, 0755);
+    apps_dir = fs_create_node(fs_root, "apps", FS_DIR, 0, 0, 0755);
+
+    calc = fs_create_node(apps_dir ? apps_dir : fs_root, "calc.app", FS_FILE, 0, 0, 0755);
     if (calc) {
         calc->size = calc_app_size;
         calc->content = (char*)calc_app_data;
     }
 
-    edit = fs_create_node(fs_root, "edit.app", FS_FILE, 0, 0, 0755);
+    edit = fs_create_node(apps_dir ? apps_dir : fs_root, "edit.app", FS_FILE, 0, 0, 0755);
     if (edit) {
         edit->size = edit_app_size;
         edit->content = (char*)edit_app_data;
@@ -832,6 +846,50 @@ void cmd_chown(const char *owner_name, const char *path) {
     }
     node->owner_uid = owner->uid;
     node->group_gid = owner->gid;
+}
+
+int fs_resolve_app_command(const char *name, char *out, int out_size) {
+    int pos = 0;
+    int name_has_path = 0;
+
+    if (!name || !name[0] || !out || out_size < 2) return 0;
+
+    for (int i = 0; name[i]; i++) {
+        if (name[i] == '/') {
+            name_has_path = 1;
+            break;
+        }
+    }
+
+    if (name_has_path) {
+        copy_limited(out, name, out_size);
+        return 1;
+    }
+
+    while (FS_APP_DIR[pos] && pos < out_size - 1) {
+        out[pos] = FS_APP_DIR[pos];
+        pos++;
+    }
+    if (pos >= out_size - 1) return 0;
+    out[pos++] = '/';
+
+    for (int i = 0; name[i] && pos < out_size - 1; i++) out[pos++] = name[i];
+    if (!ends_with(name, ".app")) {
+        const char *suffix = ".app";
+        for (int i = 0; suffix[i] && pos < out_size - 1; i++) out[pos++] = suffix[i];
+    }
+    out[pos] = '\0';
+    return 1;
+}
+
+int fs_can_exec_path(const char *path) {
+    fs_node_t *file = fs_resolve_node(current_dir, path);
+
+    if (!file) return 0;
+    if (file->flags != FS_FILE) return 0;
+    if (!fs_has_perm(file, FS_PERM_READ | FS_PERM_EXEC)) return 0;
+    if (file->size == 0 || !file->content) return 0;
+    return 1;
 }
 
 void cmd_ram_exec(const char *path) {

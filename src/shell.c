@@ -124,6 +124,8 @@ static shell_location_t shell_location = SHELL_STORAGE;
 
 static void handle_command(char *line);
 static int shell_disk_primary_mode(void);
+static int shell_try_launch_app_command(const char *name);
+static void shell_exec_app_command(const char *name);
 
 static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out) {
     if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
@@ -595,8 +597,42 @@ static void print_storage_help(void) {
     else puts("Root: ls, cd ram, cd disk, cd /\n");
     puts("Files: ls [path], cd <path>, pwd, mkdir <path>, mkdir -p <path>, rmdir <path>, touch <path>, rm <path>, cat <path>, write <path> <text>, cp <src> <dst>\n");
     puts("Disk: disk devices, disk use <n>, disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
-    puts("System: install, exec, usb, clear, help, shutdown, reboot\n");
+    puts("Apps: bundled apps are stored in /apps and can be launched by name, like calc or edit\n");
+    puts("System: install, exec <app|path>, usb, clear, help, shutdown, reboot\n");
     print_usb_help();
+}
+
+static int shell_try_launch_app_command(const char *name) {
+    char app_path[128];
+
+    if (!name || !name[0]) return 0;
+    if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) return 0;
+
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
+        if (!disk_can_exec_path(app_path)) return 0;
+        cmd_disk_exec(app_path);
+        return 1;
+    }
+
+    if (!fs_can_exec_path(app_path)) return 0;
+    cmd_ram_exec(app_path);
+    return 1;
+}
+
+static void shell_exec_app_command(const char *name) {
+    char app_path[128];
+
+    if (!name || !name[0]) {
+        puts("exec: missing application name\n");
+        return;
+    }
+    if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) {
+        puts("exec: invalid application name\n");
+        return;
+    }
+
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) cmd_disk_exec(app_path);
+    else cmd_ram_exec(app_path);
 }
 
 static void enter_logged_user_home(void) {
@@ -1123,10 +1159,8 @@ static void handle_command(char *line) {
             } else puts("disk write: missing path or text\n");
         } else puts("disk: unknown command\n");
     } else if (strcmp(argv[0], "exec") == 0) {
-        if (argc > 1) {
-            if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) cmd_disk_exec(argv[1]);
-            else cmd_ram_exec(argv[1]);
-        } else puts("exec: missing application name\n");
+        if (argc > 1) shell_exec_app_command(argv[1]);
+        else puts("exec: missing application name\n");
     } else if (strcmp(argv[0], "help") == 0) {
         puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
         print_storage_help();
@@ -1177,7 +1211,7 @@ static void handle_command(char *line) {
             puts("usb: unknown command\n");
             print_usb_help();
         }
-    } else {
+    } else if (!shell_try_launch_app_command(argv[0])) {
         COLOR = COLOR_ERROR;
         puts("Unknown command: ");
         puts(argv[0]);
