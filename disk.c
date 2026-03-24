@@ -2,6 +2,13 @@
 #include "console.h"
 #include "io.h"
 #include "kstring.h"
+#include "bootsector.h"
+#include "shell.h"
+#include "sdk/mljos_api.h"
+
+typedef void (*app_entry_t)(mljos_api_t*);
+
+extern uint32_t _kernel_end;
 
 #define FAT32_ATTR_DIRECTORY 0x10
 #define FAT32_ATTR_LFN       0x0F
@@ -69,6 +76,14 @@ static fat32_volume_t g_fat32 = {0};
 static int g_disk_io_error = 0;
 
 static int fat32_build_short_name(const char *name, uint8_t out[11]);
+
+static int disk_is_elf_image(const char *data, uint32_t size) {
+    return size >= 4
+        && (uint8_t)data[0] == 0x7F
+        && data[1] == 'E'
+        && data[2] == 'L'
+        && data[3] == 'F';
+}
 
 static int fat32_ascii_equal(const char *a, const char *b) {
     int i = 0;
@@ -173,6 +188,8 @@ static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
 }
 
 static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
+    uint8_t status;
+
     if (!ata_wait_bsy()) return 0;
     outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
     outb(0x1F2, 1);
@@ -188,8 +205,9 @@ static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
         outw(0x1F0, data);
     }
 
-    outb(0x1F7, 0xE7);
     if (!ata_wait_bsy()) return 0;
+    status = inb(0x1F7);
+    if (status & 0x01) return 0;
     return 1;
 }
 
@@ -1168,15 +1186,23 @@ void cmd_disk_ls(const char *path) {
 
     if (strcmp(resolved_path, "/") != 0) {
         if (!fat32_resolve_path(resolved_path, &dir_cluster, &target)) {
-            puts("disk ls: path not found\n");
-            return;
+            if (!path || !path[0]) {
+                fat32_reset_cwd();
+                fat32_path_copy(resolved_path, "/");
+                dir_cluster = g_fat32.root_cluster;
+            } else {
+                puts("disk ls: path not found\n");
+                return;
+            }
         }
-        if (!(target.entry.attr & FAT32_ATTR_DIRECTORY)) {
+        if (strcmp(resolved_path, "/") != 0 && !(target.entry.attr & FAT32_ATTR_DIRECTORY)) {
             fat32_print_lookup_name(&target);
             putchar('\n');
             return;
         }
-        dir_cluster = fat32_dir_first_cluster(&target.entry);
+        if (strcmp(resolved_path, "/") != 0) {
+            dir_cluster = fat32_dir_first_cluster(&target.entry);
+        }
     }
 
     cluster = dir_cluster;
@@ -1241,6 +1267,13 @@ void cmd_disk_ls(const char *path) {
     }
 
     putchar('\n');
+}
+
+void disk_prepare_session(void) {
+    fat32_reset_cwd();
+    g_disk_io_error = 0;
+    g_fat32.mounted = 0;
+    (void)fat32_mount();
 }
 
 void cmd_disk_cd(const char *path) {
@@ -1532,4 +1565,118 @@ void cmd_disk_rm(const char *path) {
     if (!ata_write_sector(entry.slot.sector_lba, sector)) {
         puts("disk rm: ATA write error\n");
     }
+}
+
+const char *disk_get_cwd_path(void) {
+    return g_fat32.current_path[0] ? g_fat32.current_path : "/";
+}
+
+void cmd_disk_install(void) {
+    uint32_t kernel_start = 0x100000;
+    uint32_t kernel_size = (uint32_t)&_kernel_end - kernel_start;
+    uint32_t num_sectors = (kernel_size + 511) / 512;
+    uint8_t sector0[512];
+
+    puts("Installing OS to disk...");
+    putchar('\n');
+
+    if (!ata_read_sector(0, sector0)) {
+        puts("Failed to read MBR\n");
+        return;
+    }
+
+    for (uint32_t i = 0; i < 446; i++) {
+        sector0[i] = i < sizeof(bootsector_data) ? bootsector_data[i] : 0;
+    }
+
+    sector0[BOOTSECTOR_PATCH_OFFSET] = (uint8_t)(num_sectors & 0xFF);
+    sector0[BOOTSECTOR_PATCH_OFFSET + 1] = (uint8_t)((num_sectors >> 8) & 0xFF);
+    sector0[BOOTSECTOR_PATCH_OFFSET + 2] = (uint8_t)((num_sectors >> 16) & 0xFF);
+    sector0[BOOTSECTOR_PATCH_OFFSET + 3] = (uint8_t)((num_sectors >> 24) & 0xFF);
+
+    if (!ata_write_sector(0, sector0)) {
+        puts("Failed to write bootloader to MBR\n");
+        return;
+    }
+
+    if (num_sectors > 2047) {
+        puts("Kernel is too large to fit in unpartitioned space!\n");
+        return;
+    }
+
+    uint8_t *kmem = (uint8_t *)kernel_start;
+    for (uint32_t i = 0; i < num_sectors; i++) {
+        if (!ata_write_sector(1 + i, kmem + (i * 512))) {
+            puts("Failed to write kernel data to disk\n");
+            return;
+        }
+    }
+
+    puts("Install complete! You can now boot directly from this hard disk.\n");
+}
+
+void cmd_disk_exec(const char *path) {
+    fat32_lookup_result_t entry;
+    uint32_t file_cluster;
+    uint32_t remaining;
+    uint8_t cluster_buffer[4096];
+    uint32_t cluster_bytes;
+    char resolved_path[128];
+
+    g_disk_io_error = 0;
+    if (!fat32_mount()) {
+        puts("Disk not formatted as FAT32.\n");
+        return;
+    }
+
+    if (!fat32_normalize_path(path, resolved_path) || strcmp(resolved_path, "/") == 0) {
+        puts("exec: path must point to a file\n");
+        return;
+    }
+
+    if (!fat32_resolve_path(resolved_path, NULL, &entry)) {
+        puts("exec: file not found\n");
+        return;
+    }
+
+    if (entry.entry.attr & FAT32_ATTR_DIRECTORY) {
+        puts("exec: target is a directory\n");
+        return;
+    }
+
+    file_cluster = fat32_dir_first_cluster(&entry.entry);
+    remaining = entry.entry.file_size;
+    cluster_bytes = (uint32_t)g_fat32.sectors_per_cluster * 512U;
+    
+    if (remaining == 0) {
+        puts("exec: file is empty\n");
+        return;
+    }
+
+    char *app_start = (char *)0x800000;
+    uint32_t offset = 0;
+
+    while (remaining > 0 && file_cluster >= 2) {
+        fat32_read_cluster(file_cluster, cluster_buffer);
+        if (g_disk_io_error) {
+            puts("exec: ATA read error\n");
+            return;
+        }
+        uint32_t chunk = remaining > cluster_bytes ? cluster_bytes : remaining;
+        for (uint32_t i = 0; i < chunk; i++) {
+            app_start[offset++] = (char)cluster_buffer[i];
+        }
+        remaining -= chunk;
+        if (remaining == 0) break;
+        file_cluster = fat32_read_fat_entry(file_cluster);
+        if (is_fat32_eoc(file_cluster)) break;
+    }
+
+    if (disk_is_elf_image(app_start, offset)) {
+        puts("exec: unsupported ELF app format\n");
+        return;
+    }
+
+    app_entry_t app = (app_entry_t)app_start;
+    app(&os_api);
 }

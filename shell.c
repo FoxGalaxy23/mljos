@@ -5,6 +5,14 @@
 #include "io.h"
 #include "kstring.h"
 #include "rtc.h"
+#include "rtc.h"
+
+mljos_api_t os_api = {
+    .puts = puts,
+    .putchar = putchar,
+    .clear_screen = clear_screen,
+    .read_line = read_line
+};
 
 #define HISTORY_SIZE 16
 
@@ -29,6 +37,47 @@ static const char scancode_map_shift[128] = {
 static char history[HISTORY_SIZE][128];
 static int history_count = 0;
 static int history_pos = -1;
+
+typedef enum storage_target {
+    STORAGE_RAM = 0,
+    STORAGE_DISK = 1
+} storage_target_t;
+
+typedef enum shell_location {
+    SHELL_ROOT = 0,
+    SHELL_STORAGE = 1
+} shell_location_t;
+
+static storage_target_t active_storage = STORAGE_RAM;
+static shell_location_t shell_location = SHELL_ROOT;
+
+static const char *storage_name(storage_target_t storage) {
+    return storage == STORAGE_DISK ? "disk" : "ram";
+}
+
+static void print_ram_prompt_path(fs_node_t *node) {
+    if (!node || !fs_root) return;
+    if (node == fs_root) {
+        putchar('/');
+        return;
+    }
+
+    print_ram_prompt_path(node->parent);
+    if (node->parent != fs_root) putchar('/');
+    puts(node->name);
+}
+
+static void print_active_path(void) {
+    if (shell_location == SHELL_ROOT) {
+        putchar('/');
+        return;
+    }
+
+    puts(storage_name(active_storage));
+    putchar(':');
+    if (active_storage == STORAGE_DISK) puts(disk_get_cwd_path());
+    else print_ram_prompt_path(current_dir);
+}
 
 static void cmd_time(void) {
     uint8_t h, m, s;
@@ -126,7 +175,7 @@ static void clear_input_visual(int prompt_row, int prompt_col) {
     update_cursor();
 }
 
-static int read_line(char *buf, int maxlen) {
+int read_line(char *buf, int maxlen) {
     int len = 0;
     int prompt_row = cursor_row;
     int prompt_col = cursor_col;
@@ -374,10 +423,121 @@ static void print_prompt(void) {
     uint8_t old_color = COLOR;
     COLOR = COLOR_PROMPT;
     puts("root@mljOS:");
-    if (current_dir && strcmp(current_dir->name, "/") != 0) puts(current_dir->name);
-    else puts("/");
+    print_active_path();
     puts("# ");
     COLOR = old_color;
+}
+
+static void print_storage_help(void) {
+    puts("Root: ls, cd ram, cd disk, cd /\n");
+    puts("Files: ls [path], cd <path>, pwd, mkdir <path>, rm <path>, cat <path>, write <path> <text>\n");
+    puts("RAM only: touch <name>, cp <src> <dst>\n");
+    puts("Disk only: disk format\n");
+    puts("Legacy aliases: disk ls/cd/pwd/mkdir/write/cat/rm\n");
+    puts("Quotes: write \"My Folder/File.txt\" \"hello world\"\n");
+    puts("System: install (installs OS to disk)\n");
+}
+
+static void enter_storage(storage_target_t storage) {
+    active_storage = storage;
+    shell_location = SHELL_STORAGE;
+    if (storage == STORAGE_DISK) disk_prepare_session();
+}
+
+static int is_at_storage_root(void) {
+    if (shell_location != SHELL_STORAGE) return 0;
+    if (active_storage == STORAGE_DISK) return strcmp(disk_get_cwd_path(), "/") == 0;
+    return current_dir == fs_root;
+}
+
+static void cmd_ls_active(const char *path) {
+    if (shell_location == SHELL_ROOT) {
+        puts("ram\n");
+        puts("disk\n");
+        return;
+    }
+    if (active_storage == STORAGE_DISK) cmd_disk_ls(path);
+    else cmd_ls_path(path);
+}
+
+static void cmd_cd_active(const char *path) {
+    if (!path || !path[0]) {
+        puts("cd: missing operand\n");
+        return;
+    }
+
+    if (strcmp(path, "/") == 0) {
+        if (shell_location == SHELL_ROOT) return;
+        if (active_storage == STORAGE_DISK) cmd_disk_cd("/");
+        else cmd_cd("/");
+        shell_location = SHELL_ROOT;
+        return;
+    }
+
+    if (shell_location == SHELL_ROOT) {
+        if (strcmp(path, "ram") == 0) enter_storage(STORAGE_RAM);
+        else if (strcmp(path, "disk") == 0) enter_storage(STORAGE_DISK);
+        else puts("cd: unknown storage\n");
+        return;
+    }
+
+    if (strcmp(path, "..") == 0 && is_at_storage_root()) {
+        shell_location = SHELL_ROOT;
+        return;
+    }
+
+    if (active_storage == STORAGE_DISK) cmd_disk_cd(path);
+    else cmd_cd(path);
+}
+
+static void cmd_pwd_active(void) {
+    if (shell_location == SHELL_ROOT) {
+        puts("/\n");
+        return;
+    }
+
+    puts(storage_name(active_storage));
+    putchar(':');
+    if (active_storage == STORAGE_DISK) cmd_disk_pwd();
+    else {
+        cmd_pwd();
+    }
+}
+
+static void cmd_mkdir_active(const char *path) {
+    if (shell_location == SHELL_ROOT) {
+        puts("mkdir: select a storage first with cd ram or cd disk\n");
+        return;
+    }
+    if (active_storage == STORAGE_DISK) cmd_disk_mkdir(path);
+    else cmd_mkdir(path);
+}
+
+static void cmd_rm_active(const char *path) {
+    if (shell_location == SHELL_ROOT) {
+        puts("rm: select a storage first with cd ram or cd disk\n");
+        return;
+    }
+    if (active_storage == STORAGE_DISK) cmd_disk_rm(path);
+    else cmd_rm(path);
+}
+
+static void cmd_cat_active(const char *path) {
+    if (shell_location == SHELL_ROOT) {
+        puts("cat: select a storage first with cd ram or cd disk\n");
+        return;
+    }
+    if (active_storage == STORAGE_DISK) cmd_disk_cat(path);
+    else cmd_cat(path);
+}
+
+static void cmd_write_active(const char *path, const char *text) {
+    if (shell_location == SHELL_ROOT) {
+        puts("write: select a storage first with cd ram or cd disk\n");
+        return;
+    }
+    if (active_storage == STORAGE_DISK) cmd_disk_write(path, text);
+    else cmd_write(path, text);
 }
 
 static void handle_command(char *line) {
@@ -416,30 +576,38 @@ static void handle_command(char *line) {
         cmd_shutdown();
     } else if (strcmp(argv[0], "clear") == 0) {
         clear_screen();
+    } else if (strcmp(argv[0], "install") == 0) {
+        cmd_disk_install();
     } else if (strcmp(argv[0], "ls") == 0) {
-        cmd_ls();
+        if (argc > 1) cmd_ls_active(argv[1]);
+        else cmd_ls_active(NULL);
     } else if (strcmp(argv[0], "cd") == 0) {
-        if (argc > 1) cmd_cd(argv[1]);
-        else puts("cd: missing operand\n");
+        cmd_cd_active(argc > 1 ? argv[1] : NULL);
+    } else if (strcmp(argv[0], "pwd") == 0) {
+        cmd_pwd_active();
     } else if (strcmp(argv[0], "mkdir") == 0) {
-        if (argc > 1) cmd_mkdir(argv[1]);
+        if (argc > 1) cmd_mkdir_active(argv[1]);
         else puts("mkdir: missing operand\n");
     } else if (strcmp(argv[0], "touch") == 0) {
-        if (argc > 1) cmd_touch(argv[1]);
+        if (shell_location == SHELL_ROOT) puts("touch: select a storage first with cd ram\n");
+        else if (active_storage == STORAGE_DISK) puts("touch: available only for ram storage\n");
+        else if (argc > 1) cmd_touch(argv[1]);
         else puts("touch: missing operand\n");
     } else if (strcmp(argv[0], "rm") == 0) {
-        if (argc > 1) cmd_rm(argv[1]);
+        if (argc > 1) cmd_rm_active(argv[1]);
         else puts("rm: missing operand\n");
     } else if (strcmp(argv[0], "cat") == 0) {
-        if (argc > 1) cmd_cat(argv[1]);
+        if (argc > 1) cmd_cat_active(argv[1]);
         else puts("cat: missing operand\n");
     } else if (strcmp(argv[0], "cp") == 0) {
-        if (argc > 2) cmd_cp(argv[1], argv[2]);
+        if (shell_location == SHELL_ROOT) puts("cp: select a storage first with cd ram\n");
+        else if (active_storage == STORAGE_DISK) puts("cp: available only for ram storage\n");
+        else if (argc > 2) cmd_cp(argv[1], argv[2]);
         else puts("cp: missing operands\n");
     } else if (strcmp(argv[0], "write") == 0) {
         if (argc > 2) {
             join_args(joined, sizeof(joined), argv, 2, argc);
-            cmd_write(argv[1], joined);
+            cmd_write_active(argv[1], joined);
         }
         else puts("write: missing file or text\n");
     } else if (strcmp(argv[0], "disk") == 0) {
@@ -472,13 +640,16 @@ static void handle_command(char *line) {
         } else {
             puts("disk: unknown command\n");
         }
+    } else if (strcmp(argv[0], "exec") == 0) {
+        if (argc > 1) {
+            if (active_storage == STORAGE_DISK) cmd_disk_exec(argv[1]);
+            else cmd_ram_exec(argv[1]);
+        } else {
+            puts("exec: missing application name\n");
+        }
     } else if (strcmp(argv[0], "help") == 0) {
-        puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
-        puts("FS: ls, cd, mkdir, touch, rm, cat, cp, write\n");
-        puts("Disk FAT32: disk format, disk ls [path], disk cd <path>, disk pwd\n");
-        puts("Disk FAT32: disk mkdir <path>\n");
-        puts("Disk FAT32: disk cat <path>, disk write <path> <text>, disk rm <path>\n");
-        puts("Quotes: disk mkdir \"My Folder\", disk write \"My Folder/File.txt\" \"hello world\"\n");
+        puts("Commands: time, date, echo, shutdown, reboot, clear, exec, help\n");
+        print_storage_help();
     } else {
         COLOR = COLOR_ERROR;
         puts("Unknown command: ");
@@ -495,10 +666,8 @@ void shell_run(void) {
     clear_screen();
     puts("Welcome to mljOS by foxgalaxy23\n");
     puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
-    puts("FS Commands: ls, cd, mkdir, touch, rm, cat, cp, write\n");
-    puts("Disk FAT32: disk format, disk ls [path], disk cd <path>, disk pwd\n");
-    puts("Disk FAT32: disk mkdir <path>\n");
-    puts("Disk FAT32: disk cat <path>, disk write <path> <text>, disk rm <path>\n\n");
+    print_storage_help();
+    putchar('\n');
 
     char linebuf[128];
     while (1) {
