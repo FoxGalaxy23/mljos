@@ -7,11 +7,22 @@
 #include "rtc.h"
 #include "users.h"
 
+static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out);
+static int app_write_file(const char *path, const char *buf, unsigned int size);
+static void os_set_cursor(int row, int col);
+static void os_putchar_at(char ch, int row, int col);
+static int os_read_key(void);
+
 mljos_api_t os_api = {
     .puts = puts,
     .putchar = putchar,
     .clear_screen = clear_screen,
-    .read_line = read_line
+    .read_line = read_line,
+    .read_file = app_read_file,
+    .write_file = app_write_file,
+    .set_cursor = os_set_cursor,
+    .putchar_at = os_putchar_at,
+    .read_key = os_read_key
 };
 
 #define HISTORY_SIZE 16
@@ -34,6 +45,65 @@ static const char scancode_map_shift[128] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 
+static int g_kbd_shift = 0;
+static int g_kbd_ctrl = 0;
+static int g_kbd_caps = 0;
+
+static void *g_shell_jmp_env[8];
+static int g_jmp_ready = 0;
+
+static void os_set_cursor(int row, int col) {
+    cursor_row = row;
+    cursor_col = col;
+    update_cursor();
+}
+
+static void os_putchar_at(char ch, int row, int col) {
+    putchar_at(ch, row, col);
+}
+
+static int os_read_key(void) {
+    while (1) {
+        while (!(inb(0x64) & 1)) {
+            __asm__ volatile ("nop");
+        }
+        uint8_t sc = inb(0x60);
+        char c = 0;
+
+        if (sc == 0x2A || sc == 0x36) { g_kbd_shift = 1; continue; }
+        if (sc == 0xAA || sc == 0xB6) { g_kbd_shift = 0; continue; }
+        if (sc == 0x1D) { g_kbd_ctrl = 1; continue; }
+        if (sc == 0x9D) { g_kbd_ctrl = 0; continue; }
+        if (sc == 0x3A) { g_kbd_caps = !g_kbd_caps; continue; }
+
+        if (sc == 0x48) return 1000;
+        if (sc == 0x50) return 1001;
+        if (sc == 0x4B) return 1002;
+        if (sc == 0x4D) return 1003;
+
+        if (sc & 0x80) continue;
+
+        if (sc < 128) {
+            int is_letter = ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) || (sc >= 0x2C && sc <= 0x32));
+            int use_shift = g_kbd_shift;
+            if (g_kbd_caps && is_letter) use_shift = !use_shift;
+            c = use_shift ? scancode_map_shift[sc] : scancode_map_normal[sc];
+            
+            if (g_kbd_ctrl && is_letter) {
+                char base = scancode_map_normal[sc];
+                if (base == 'c') {
+                    if (g_jmp_ready) {
+                        g_kbd_ctrl = 0;
+                        __builtin_longjmp(g_shell_jmp_env, 1);
+                    }
+                }
+                if (base >= 'a' && base <= 'z') return base - 'a' + 1;
+            }
+        }
+        if (c != 0) return c;
+    }
+}
+
 static char history[HISTORY_SIZE][128];
 static int history_count = 0;
 static int history_pos = -1;
@@ -52,6 +122,21 @@ static storage_target_t active_storage = STORAGE_RAM;
 static shell_location_t shell_location = SHELL_STORAGE;
 
 static void handle_command(char *line);
+static int shell_disk_primary_mode(void);
+
+static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out) {
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
+        return disk_read_file(path, buf, maxlen, (uint32_t*)size_out);
+    }
+    return fs_read_file(path, buf, maxlen, (uint32_t*)size_out);
+}
+
+static int app_write_file(const char *path, const char *buf, unsigned int size) {
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
+        return disk_write_file(path, buf, size);
+    }
+    return fs_write_file(path, buf, (uint32_t)size);
+}
 
 static int shell_disk_primary_mode(void) {
     return users_system_is_installed();
@@ -181,8 +266,6 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
     int len = 0;
     int prompt_row = cursor_row;
     int prompt_col = cursor_col;
-    int shift_down = 0;
-    int capslock = 0;
     uint8_t old_color = COLOR;
 
     history_pos = -1;
@@ -198,18 +281,11 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
             uint8_t sc = inb(0x60);
             char c = 0;
 
-            if (sc == 0x2A || sc == 0x36) {
-                shift_down = 1;
-                continue;
-            }
-            if (sc == 0xAA || sc == 0xB6) {
-                shift_down = 0;
-                continue;
-            }
-            if (sc == 0x3A) {
-                capslock = !capslock;
-                continue;
-            }
+            if (sc == 0x2A || sc == 0x36) { g_kbd_shift = 1; continue; }
+            if (sc == 0xAA || sc == 0xB6) { g_kbd_shift = 0; continue; }
+            if (sc == 0x1D) { g_kbd_ctrl = 1; continue; }
+            if (sc == 0x9D) { g_kbd_ctrl = 0; continue; }
+            if (sc == 0x3A) { g_kbd_caps = !g_kbd_caps; continue; }
 
             if (sc == 0x48) {
                 if (!allow_history || history_count == 0) continue;
@@ -300,9 +376,16 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
 
             if (sc < 128) {
                 int is_letter = ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) || (sc >= 0x2C && sc <= 0x32));
-                int use_shift_map = shift_down;
-                if (capslock && is_letter) use_shift_map = !use_shift_map;
+                int use_shift_map = g_kbd_shift;
+                if (g_kbd_caps && is_letter) use_shift_map = !use_shift_map;
                 c = use_shift_map ? scancode_map_shift[sc] : scancode_map_normal[sc];
+
+                if (g_kbd_ctrl && is_letter && scancode_map_normal[sc] == 'c') {
+                    if (g_jmp_ready) {
+                        g_kbd_ctrl = 0;
+                        __builtin_longjmp(g_shell_jmp_env, 1);
+                    }
+                }
             }
             if (c == 0) continue;
 
@@ -1027,6 +1110,13 @@ void shell_run(void) {
     } else {
         do_login();
     }
+
+    if (__builtin_setjmp(g_shell_jmp_env)) {
+        COLOR = COLOR_DEFAULT;
+        puts("\n^C\n");
+        users_end_sudo();
+    }
+    g_jmp_ready = 1;
 
     {
         char linebuf[128];

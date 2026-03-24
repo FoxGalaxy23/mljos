@@ -5,6 +5,7 @@
 #include "shell.h"
 #include "users.h"
 #include "apps/calc_app.h"
+#include "apps/edit_app.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -396,6 +397,7 @@ int fs_sync_to_disk(void) {
 
 void fs_init(void) {
     fs_node_t *calc;
+    fs_node_t *edit;
 
     fs_node_count = 0;
     fs_data_offset = 0;
@@ -406,7 +408,7 @@ void fs_init(void) {
     fs_root->flags = FS_DIR;
     fs_root->owner_uid = 0;
     fs_root->group_gid = 0;
-    fs_root->mode = 0755;
+    fs_root->mode = 0777; // Relaxed root permissions for live environment testing
     fs_root->size = 0;
     fs_root->parent = fs_root;
     fs_root->child = NULL;
@@ -418,6 +420,12 @@ void fs_init(void) {
     if (calc) {
         calc->size = calc_app_size;
         calc->content = (char*)calc_app_data;
+    }
+
+    edit = fs_create_node(fs_root, "edit.app", FS_FILE, 0, 0, 0755);
+    if (edit) {
+        edit->size = edit_app_size;
+        edit->content = (char*)edit_app_data;
     }
 }
 
@@ -685,49 +693,55 @@ void cmd_cat(const char *path) {
 }
 
 void cmd_write(const char *path, const char *text) {
+    if (!fs_write_file(path, text, text ? strlen(text) : 0)) puts("write: unable to write file\n");
+}
+
+int fs_write_file(const char *path, const char *data, uint32_t size) {
     char leaf[32];
     fs_node_t *parent = fs_resolve_parent(current_dir, path, leaf, sizeof(leaf));
     fs_node_t *file;
     const user_account_t *user = users_effective();
-    unsigned int len;
 
-    if (!parent || !leaf[0]) {
-        puts("write: invalid path\n");
-        return;
-    }
+    if (!parent || !leaf[0]) return 0;
 
     file = fs_find_child(parent, leaf);
     if (!file) {
-        if (!fs_has_perm(parent, FS_PERM_WRITE | FS_PERM_EXEC)) {
-            puts("write: permission denied\n");
-            return;
-        }
+        if (!fs_has_perm(parent, FS_PERM_WRITE | FS_PERM_EXEC)) return 0;
         file = fs_create_node(parent, leaf, FS_FILE, user->uid, user->gid, fs_default_file_mode());
-        if (!file) {
-            puts("write: cannot create file\n");
-            return;
-        }
+        if (!file) return 0;
     }
 
-    if (file->flags != FS_FILE) {
-        puts("write: is a directory\n");
-        return;
-    }
-    if (!fs_has_perm(file, FS_PERM_WRITE)) {
-        puts("write: permission denied\n");
-        return;
+    if (file->flags != FS_FILE) return 0;
+    if (!fs_has_perm(file, FS_PERM_WRITE)) return 0;
+
+    // Prevent memory leaks on continuous edits by reusing the old allocation if possible
+    if (file->size >= size && file->content != NULL) {
+        for (uint32_t i = 0; i < size; i++) file->content[i] = data[i];
+        file->size = size;
+        return 1;
     }
 
-    len = strlen(text);
-    if (fs_data_offset + (int)len > FS_POOL_SIZE) {
-        puts("write: out of space\n");
-        return;
-    }
+    if (fs_data_offset + (int)size > FS_POOL_SIZE) return 0;
 
     file->content = &fs_data_pool[fs_data_offset];
-    for (unsigned int i = 0; i < len; i++) file->content[i] = text[i];
-    file->size = len;
-    fs_data_offset += (int)len;
+    for (uint32_t i = 0; i < size; i++) file->content[i] = data[i];
+    file->size = size;
+    fs_data_offset += (int)size;
+    return 1;
+}
+
+int fs_read_file(const char *path, char *out, int maxlen, uint32_t *size_out) {
+    fs_node_t *file = fs_resolve_node(current_dir, path);
+
+    if (!file || !out || maxlen <= 0) return 0;
+    if (file->flags != FS_FILE) return 0;
+    if (!fs_has_perm(file, FS_PERM_READ)) return 0;
+    if ((int)file->size >= maxlen) return 0;
+
+    for (uint32_t i = 0; i < file->size; i++) out[i] = file->content ? file->content[i] : '\0';
+    out[file->size] = '\0';
+    if (size_out) *size_out = file->size;
+    return 1;
 }
 
 void cmd_cp(const char *src_path, const char *dst_path) {

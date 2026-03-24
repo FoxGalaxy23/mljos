@@ -45,24 +45,40 @@ with open("bootsector.h", "w") as f:
 if [ $? -ne 0 ]; then echo "Failed to generate bootsector.h"; exit 1; fi
 
 echo "Building apps..."
-i686-linux-gnu-gcc -m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector -fPIC -c apps/calc.c -o apps/calc.o
-if [ $? -ne 0 ]; then echo "Failed to compile calc.c"; exit 1; fi
-i686-linux-gnu-ld -m elf_i386 -T sdk/linker.app.ld apps/calc.o -o apps/calc.elf
-if [ $? -ne 0 ]; then echo "Failed to link calc.elf"; exit 1; fi
-i686-linux-gnu-objcopy -O binary apps/calc.elf apps/calc.app
-if [ $? -ne 0 ]; then echo "Failed to convert calc.app to flat binary"; exit 1; fi
+APP_ELFS=""
+for src in apps/*.c; do
+    app_name=$(basename "$src" .c)
+    app_obj="apps/$app_name.o"
+    app_elf="apps/$app_name.elf"
+    app_bin="apps/$app_name.app"
+    app_hdr="apps/${app_name}_app.h"
+    app_guard=$(echo "${app_name}_app_h" | tr '[:lower:].' '[:upper:]_')
 
-python3 -c '
-import sys
-with open("apps/calc.app", "rb") as f: data = f.read()
-with open("apps/calc_app.h", "w") as f:
-    f.write("#ifndef CALC_APP_H\n#define CALC_APP_H\n\n")
-    f.write(f"static const unsigned int calc_app_size = {len(data)};\n")
-    f.write("static const unsigned char calc_app_data[] = {\n")
-    f.write("    " + ", ".join([f"0x{b:02x}" for b in data]) + "\n")
-    f.write("};\n\n#endif\n")
-'
-if [ $? -ne 0 ]; then echo "Failed to generate calc_app.h"; exit 1; fi
+    i686-linux-gnu-gcc -m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector -fPIC -c "$src" -o "$app_obj"
+    if [ $? -ne 0 ]; then echo "Failed to compile $src"; exit 1; fi
+    i686-linux-gnu-ld -m elf_i386 -T sdk/linker.app.ld "$app_obj" -o "$app_elf"
+    if [ $? -ne 0 ]; then echo "Failed to link $app_elf"; exit 1; fi
+    i686-linux-gnu-objcopy -O binary "$app_elf" "$app_bin"
+    if [ $? -ne 0 ]; then echo "Failed to convert $app_bin"; exit 1; fi
+
+    python3 -c "
+import pathlib
+app_path = pathlib.Path('$app_bin')
+header_path = pathlib.Path('$app_hdr')
+guard = '$app_guard'
+name = '$app_name'
+data = app_path.read_bytes()
+with header_path.open('w') as f:
+    f.write(f'#ifndef {guard}\\n#define {guard}\\n\\n')
+    f.write(f'static const unsigned int {name}_app_size = {len(data)};\\n')
+    f.write(f'static const unsigned char {name}_app_data[] = {{\\n')
+    f.write('    ' + ', '.join(f'0x{b:02x}' for b in data) + '\\n')
+    f.write('};\\n\\n#endif\\n')
+"
+    if [ $? -ne 0 ]; then echo "Failed to generate $app_hdr"; exit 1; fi
+
+    APP_ELFS="$APP_ELFS $app_elf"
+done
 
 # Compile C sources
 C_SOURCES="kernel.c console.c kstring.c rtc.c fs.c disk.c users.c shell.c"
@@ -92,6 +108,6 @@ grub-mkrescue -o mljOS.iso isodir
 if [ $? -ne 0 ]; then echo "Failed to create ISO"; exit 1; fi
 
 echo "Cleaning up temporary files..."
-rm -f $OBJECTS boot.o isodir/boot/mljos.bin mljos.bin apps/calc.elf
+rm -f $OBJECTS boot.o isodir/boot/mljos.bin mljos.bin $APP_ELFS
 
 echo "Build successful! Created mljOS.iso"
