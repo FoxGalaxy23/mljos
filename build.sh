@@ -12,10 +12,10 @@ KERNEL_BIN="$BUILD_DIR/mljos.bin"
 ISO_IMAGE="$BUILD_DIR/mljOS.iso"
 
 INCLUDE_FLAGS="-I$ROOT_DIR/include -I$GENERATED_INCLUDE_DIR"
-CFLAGS="-m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector"
-APP_CFLAGS="$CFLAGS -fPIC"
+CFLAGS="-m64 -nostdlib -nostdinc -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -mno-red-zone"
+APP_CFLAGS="$CFLAGS"
 
-DEPS="gcc-i686-linux-gnu binutils-i686-linux-gnu nasm grub-pc-bin grub-common xorriso mtools"
+DEPS="gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu nasm grub-pc-bin grub-common xorriso mtools"
 
 echo "Checking for missing dependencies..."
 MISSING_DEPS=""
@@ -71,9 +71,9 @@ for src in "$ROOT_DIR"/apps/*.c; do
     app_hdr="$GENERATED_INCLUDE_DIR/apps/${app_name}_app.h"
     app_guard=$(echo "${app_name}_app_h" | tr '[:lower:].' '[:upper:]_')
 
-    i686-linux-gnu-gcc $APP_CFLAGS $INCLUDE_FLAGS -c "$src" -o "$app_obj"
-    i686-linux-gnu-ld -m elf_i386 -T "$ROOT_DIR/config/linker.app.ld" "$app_obj" -o "$app_elf"
-    i686-linux-gnu-objcopy -O binary "$app_elf" "$app_bin"
+    x86_64-linux-gnu-gcc $APP_CFLAGS $INCLUDE_FLAGS -c "$src" -o "$app_obj"
+    x86_64-linux-gnu-ld -m elf_x86_64 -T "$ROOT_DIR/config/linker.app.ld" "$app_obj" -o "$app_elf"
+    x86_64-linux-gnu-objcopy -O binary "$app_elf" "$app_bin"
 
     python3 -c "
 import pathlib
@@ -97,15 +97,15 @@ echo "Compiling kernel sources..."
 OBJECTS=""
 for src in "$ROOT_DIR"/src/*.c; do
     obj="$OBJ_DIR/$(basename "${src%.c}").o"
-    i686-linux-gnu-gcc $CFLAGS $INCLUDE_FLAGS -c "$src" -o "$obj"
+    x86_64-linux-gnu-gcc $CFLAGS $INCLUDE_FLAGS -c "$src" -o "$obj"
     OBJECTS="$OBJECTS $obj"
 done
 
 echo "Assembling bootloader..."
-nasm -f elf32 "$ROOT_DIR/boot/boot.asm" -o "$OBJ_DIR/boot.o"
+nasm -f elf64 "$ROOT_DIR/boot/boot.asm" -o "$OBJ_DIR/boot.o"
 
 echo "Linking kernel..."
-i686-linux-gnu-ld -m elf_i386 -T "$ROOT_DIR/config/linker.ld" "$OBJ_DIR/boot.o" $OBJECTS -o "$KERNEL_BIN"
+x86_64-linux-gnu-ld -m elf_x86_64 -T "$ROOT_DIR/config/linker.ld" "$OBJ_DIR/boot.o" $OBJECTS -o "$KERNEL_BIN"
 
 echo "Creating ISO image..."
 cp "$KERNEL_BIN" "$ISO_DIR/boot/mljos.bin"

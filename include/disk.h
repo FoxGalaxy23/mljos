@@ -4,6 +4,10 @@
 #include "common.h"
 
 void cmd_disk_format(void);
+void cmd_disk_devices(void);
+int disk_select_device(int index);
+int disk_get_active_device(void);
+int disk_get_device_count(void);
 void cmd_disk_ls(const char *path);
 void cmd_disk_cd(const char *path);
 void cmd_disk_pwd(void);

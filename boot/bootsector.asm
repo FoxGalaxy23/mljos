@@ -100,8 +100,8 @@ wait_drq:
     inc ebx
     loop read_loop
 
-    ; Jump to kernel
-    jmp 0x10000C ; start symbol is right after 12 bytes of multiboot header
+    ; Jump to the 32-bit kernel entry after the 24-byte Multiboot2 header
+    jmp 0x100018
 
     hlt
 

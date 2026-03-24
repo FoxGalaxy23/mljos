@@ -142,6 +142,13 @@ static int shell_disk_primary_mode(void) {
     return users_system_is_installed();
 }
 
+static void print_disk_storage_name(void) {
+    int active_disk = disk_get_active_device();
+
+    puts("disk");
+    if (active_disk >= 0 && active_disk <= 9) putchar('0' + active_disk);
+}
+
 static const char *storage_name(storage_target_t storage) {
     return storage == STORAGE_DISK ? "disk" : "ram";
 }
@@ -157,10 +164,15 @@ static void print_active_path(void) {
         return;
     }
 
-    puts(storage_name(active_storage));
-    putchar(':');
-    if (active_storage == STORAGE_DISK) puts(disk_get_cwd_path());
-    else fs_print_prompt_path();
+    if (active_storage == STORAGE_DISK) {
+        print_disk_storage_name();
+        putchar(':');
+        puts(disk_get_cwd_path());
+    } else {
+        puts(storage_name(active_storage));
+        putchar(':');
+        fs_print_prompt_path();
+    }
 }
 
 static void cmd_time(void) {
@@ -516,6 +528,19 @@ static int parse_octal_mode(const char *text, uint16_t *mode_out) {
     return 1;
 }
 
+static int parse_decimal_number(const char *text, int *value_out) {
+    int value = 0;
+
+    if (!text || !text[0]) return 0;
+    for (int i = 0; text[i]; i++) {
+        if (text[i] < '0' || text[i] > '9') return 0;
+        value = (value * 10) + (text[i] - '0');
+    }
+
+    *value_out = value;
+    return 1;
+}
+
 static void mkdir_disk_parents(const char *path) {
     char temp[128];
     int pos = 0;
@@ -564,7 +589,7 @@ static void print_storage_help(void) {
     if (shell_disk_primary_mode()) puts("Root: disk-backed session, cd <path>, cd /, pwd\n");
     else puts("Root: ls, cd ram, cd disk, cd /\n");
     puts("Files: ls [path], cd <path>, pwd, mkdir <path>, mkdir -p <path>, rmdir <path>, touch <path>, rm <path>, cat <path>, write <path> <text>, cp <src> <dst>\n");
-    puts("Disk: disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
+    puts("Disk: disk devices, disk use <n>, disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
     puts("System: install, exec, clear, help, shutdown, reboot\n");
 }
 
@@ -694,10 +719,15 @@ static void cmd_pwd_active(void) {
         return;
     }
 
-    puts(storage_name(active_storage));
-    putchar(':');
-    if (active_storage == STORAGE_DISK) cmd_disk_pwd();
-    else cmd_pwd();
+    if (active_storage == STORAGE_DISK) {
+        print_disk_storage_name();
+        putchar(':');
+        cmd_disk_pwd();
+    } else {
+        puts(storage_name(active_storage));
+        putchar(':');
+        cmd_pwd();
+    }
 }
 
 static void cmd_mkdir_active(const char *path, int create_parents) {
@@ -1044,7 +1074,22 @@ static void handle_command(char *line) {
             cmd_write_active(argv[1], joined);
         } else puts("write: missing file or text\n");
     } else if (strcmp(argv[0], "disk") == 0) {
-        if (argc < 2) puts("disk: missing command (format, ls, cd, pwd, mkdir, write, cat, rm)\n");
+        if (argc < 2) puts("disk: missing command (devices, use, format, ls, cd, pwd, mkdir, write, cat, rm)\n");
+        else if (strcmp(argv[1], "devices") == 0 || strcmp(argv[1], "list") == 0) {
+            cmd_disk_devices();
+        } else if (strcmp(argv[1], "use") == 0) {
+            int disk_index = -1;
+
+            if (argc < 3) puts("disk use: missing disk index\n");
+            else if (!parse_decimal_number(argv[2], &disk_index)) puts("disk use: invalid disk index\n");
+            else if (!disk_select_device(disk_index)) puts("disk use: disk not found\n");
+            else {
+                disk_prepare_session();
+                puts("disk use: switched to disk");
+                putchar('0' + disk_index);
+                putchar('\n');
+            }
+        }
         else if (strcmp(argv[1], "format") == 0) {
             if (!users_effective_is_root()) puts("disk format: requires root\n");
             else cmd_disk_format();

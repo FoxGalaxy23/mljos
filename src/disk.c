@@ -8,7 +8,8 @@
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
-extern uint32_t _kernel_end;
+extern uint8_t _kernel_start[];
+extern uint8_t _kernel_end[];
 
 #define FAT32_ATTR_DIRECTORY 0x10
 #define FAT32_ATTR_LFN       0x0F
@@ -16,6 +17,7 @@ extern uint32_t _kernel_end;
 #define FAT32_MIN_CLUSTERS   65525U
 #define FAT32_MAX_CLUSTERS   0x0FFFFFEFU
 #define ATA_POLL_TIMEOUT     1000000U
+#define ATA_MAX_DEVICES      4
 
 typedef struct __attribute__((packed)) {
     uint8_t name[11];
@@ -72,10 +74,32 @@ typedef struct {
     int has_long_name;
 } fat32_lookup_result_t;
 
-static fat32_volume_t g_fat32 = {0};
+typedef struct {
+    uint16_t io_base;
+    uint8_t drive_select;
+    uint8_t identify_select;
+    uint32_t total_sectors;
+    int present;
+    const char *name;
+} ata_device_t;
+
+static fat32_volume_t g_fat32_volumes[ATA_MAX_DEVICES] = {0};
+static ata_device_t g_ata_devices[ATA_MAX_DEVICES] = {
+    {0x1F0, 0xE0, 0xA0, 0, 0, "ata0"},
+    {0x1F0, 0xF0, 0xB0, 0, 0, "ata1"},
+    {0x170, 0xE0, 0xA0, 0, 0, "ata2"},
+    {0x170, 0xF0, 0xB0, 0, 0, "ata3"}
+};
+static int g_disk_active_index = 0;
+static int g_disk_devices_probed = 0;
 static int g_disk_io_error = 0;
 
 static int fat32_build_short_name(const char *name, uint8_t out[11]);
+static void disk_probe_devices(void);
+static fat32_volume_t *disk_current_volume(void);
+static ata_device_t *disk_current_device(void);
+
+#define g_fat32 (*disk_current_volume())
 
 static int disk_is_elf_image(const char *data, uint32_t size) {
     return size >= 4
@@ -125,6 +149,19 @@ static void *kmemcpy(void *dst, const void *src, uint32_t n) {
     return dst;
 }
 
+static void print_uint(uint32_t value) {
+    char buf[11];
+    int pos = 10;
+
+    buf[pos] = '\0';
+    do {
+        buf[--pos] = (char)('0' + (value % 10));
+        value /= 10;
+    } while (value > 0 && pos > 0);
+
+    puts(&buf[pos]);
+}
+
 static uint16_t read_le16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
@@ -152,80 +189,121 @@ static int is_fat32_eoc(uint32_t value) {
     return (value & 0x0FFFFFFF) >= 0x0FFFFFF8;
 }
 
-static int ata_wait_bsy(void) {
+static fat32_volume_t *disk_current_volume(void) {
+    if (g_disk_active_index < 0 || g_disk_active_index >= ATA_MAX_DEVICES) g_disk_active_index = 0;
+    return &g_fat32_volumes[g_disk_active_index];
+}
+
+static int disk_pick_default_device(void) {
+    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
+        if (g_ata_devices[i].present) {
+            g_disk_active_index = i;
+            return 1;
+        }
+    }
+    g_disk_active_index = 0;
+    return 0;
+}
+
+static ata_device_t *disk_current_device(void) {
+    disk_probe_devices();
+    if (g_disk_active_index >= 0
+        && g_disk_active_index < ATA_MAX_DEVICES
+        && g_ata_devices[g_disk_active_index].present) {
+        return &g_ata_devices[g_disk_active_index];
+    }
+    if (!disk_pick_default_device()) return 0;
+    return &g_ata_devices[g_disk_active_index];
+}
+
+static int ata_wait_bsy(uint16_t io_base) {
     for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
-        if (!(inb(0x1F7) & 0x80)) return 1;
+        if (!(inb(io_base + 7) & 0x80)) return 1;
     }
     return 0;
 }
 
-static int ata_wait_drq_or_err(void) {
+static int ata_wait_drq_or_err(uint16_t io_base) {
     for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
-        uint8_t status = inb(0x1F7);
+        uint8_t status = inb(io_base + 7);
         if (status & 0x01) return 0;
         if (!(status & 0x80) && (status & 0x08)) return 1;
     }
     return 0;
 }
 
-static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
-    if (!ata_wait_bsy()) return 0;
-    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(0x1F2, 1);
-    outb(0x1F3, (uint8_t)lba);
-    outb(0x1F4, (uint8_t)(lba >> 8));
-    outb(0x1F5, (uint8_t)(lba >> 16));
-    outb(0x1F7, 0x20);
-    if (!ata_wait_bsy()) return 0;
-    if (!ata_wait_drq_or_err()) return 0;
+static int ata_device_read_sector(const ata_device_t *device, uint32_t lba, uint8_t *buffer) {
+    uint16_t io_base;
+
+    if (!device || !device->present) return 0;
+    io_base = device->io_base;
+
+    if (!ata_wait_bsy(io_base)) return 0;
+    outb(io_base + 6, device->drive_select | ((lba >> 24) & 0x0F));
+    outb(io_base + 2, 1);
+    outb(io_base + 3, (uint8_t)lba);
+    outb(io_base + 4, (uint8_t)(lba >> 8));
+    outb(io_base + 5, (uint8_t)(lba >> 16));
+    outb(io_base + 7, 0x20);
+    if (!ata_wait_bsy(io_base)) return 0;
+    if (!ata_wait_drq_or_err(io_base)) return 0;
 
     for (int i = 0; i < 256; i++) {
-        uint16_t data = inw(0x1F0);
+        uint16_t data = inw(io_base);
         buffer[i * 2] = (uint8_t)(data & 0xFF);
         buffer[i * 2 + 1] = (uint8_t)(data >> 8);
     }
     return 1;
 }
 
-static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
+static int ata_device_write_sector(const ata_device_t *device, uint32_t lba, const uint8_t *buffer) {
     uint8_t status;
+    uint16_t io_base;
 
-    if (!ata_wait_bsy()) return 0;
-    outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
-    outb(0x1F2, 1);
-    outb(0x1F3, (uint8_t)lba);
-    outb(0x1F4, (uint8_t)(lba >> 8));
-    outb(0x1F5, (uint8_t)(lba >> 16));
-    outb(0x1F7, 0x30);
-    if (!ata_wait_bsy()) return 0;
-    if (!ata_wait_drq_or_err()) return 0;
+    if (!device || !device->present) return 0;
+    io_base = device->io_base;
+
+    if (!ata_wait_bsy(io_base)) return 0;
+    outb(io_base + 6, device->drive_select | ((lba >> 24) & 0x0F));
+    outb(io_base + 2, 1);
+    outb(io_base + 3, (uint8_t)lba);
+    outb(io_base + 4, (uint8_t)(lba >> 8));
+    outb(io_base + 5, (uint8_t)(lba >> 16));
+    outb(io_base + 7, 0x30);
+    if (!ata_wait_bsy(io_base)) return 0;
+    if (!ata_wait_drq_or_err(io_base)) return 0;
 
     for (int i = 0; i < 256; i++) {
         uint16_t data = buffer[i * 2] | ((uint16_t)buffer[i * 2 + 1] << 8);
-        outw(0x1F0, data);
+        outw(io_base, data);
     }
 
-    if (!ata_wait_bsy()) return 0;
-    status = inb(0x1F7);
+    if (!ata_wait_bsy(io_base)) return 0;
+    status = inb(io_base + 7);
     if (status & 0x01) return 0;
     return 1;
 }
 
-static uint32_t ata_identify_total_sectors(void) {
+static uint32_t ata_identify_total_sectors(ata_device_t *device) {
     uint8_t identify[512];
+    uint16_t io_base;
 
-    outb(0x1F6, 0xE0);
-    outb(0x1F2, 0);
-    outb(0x1F3, 0);
-    outb(0x1F4, 0);
-    outb(0x1F5, 0);
-    outb(0x1F7, 0xEC);
+    if (!device) return 0;
+    io_base = device->io_base;
 
-    if (inb(0x1F7) == 0) return 0;
-    if (!ata_wait_drq_or_err()) return 0;
+    outb(io_base + 6, device->identify_select);
+    outb(io_base + 2, 0);
+    outb(io_base + 3, 0);
+    outb(io_base + 4, 0);
+    outb(io_base + 5, 0);
+    outb(io_base + 7, 0xEC);
+
+    if (inb(io_base + 7) == 0) return 0;
+    if (inb(io_base + 4) != 0 || inb(io_base + 5) != 0) return 0;
+    if (!ata_wait_drq_or_err(io_base)) return 0;
 
     for (int i = 0; i < 256; i++) {
-        uint16_t word = inw(0x1F0);
+        uint16_t word = inw(io_base);
         identify[i * 2] = (uint8_t)(word & 0xFF);
         identify[i * 2 + 1] = (uint8_t)(word >> 8);
     }
@@ -233,15 +311,46 @@ static uint32_t ata_identify_total_sectors(void) {
     return read_le32(&identify[120]);
 }
 
+static void disk_probe_devices(void) {
+    if (g_disk_devices_probed) return;
+
+    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
+        g_ata_devices[i].total_sectors = ata_identify_total_sectors(&g_ata_devices[i]);
+        g_ata_devices[i].present = g_ata_devices[i].total_sectors > 0;
+        if (!g_fat32_volumes[i].current_path[0]) {
+            g_disk_active_index = i;
+            fat32_reset_cwd();
+        }
+    }
+
+    g_disk_devices_probed = 1;
+    (void)disk_pick_default_device();
+}
+
 static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
     uint8_t zero[512];
+    ata_device_t *device = disk_current_device();
+
+    if (!device) {
+        g_disk_io_error = 1;
+        return;
+    }
+
     kmemset(zero, 0, sizeof(zero));
     for (uint32_t i = 0; i < count; i++) {
-        if (!ata_write_sector(lba + i, zero)) {
+        if (!ata_device_write_sector(device, lba + i, zero)) {
             g_disk_io_error = 1;
             return;
         }
     }
+}
+
+static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
+    return ata_device_read_sector(disk_current_device(), lba, buffer);
+}
+
+static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
+    return ata_device_write_sector(disk_current_device(), lba, buffer);
 }
 
 static uint32_t fat32_cluster_to_lba(uint32_t cluster) {
@@ -1017,8 +1126,61 @@ static int fat32_write_entry_chain(const fat32_dir_slot_t *slots, int count, con
     return fat32_write_dir_entry_at(&slots[count - 1], entry);
 }
 
+int disk_get_device_count(void) {
+    int count = 0;
+
+    disk_probe_devices();
+    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
+        if (g_ata_devices[i].present) count++;
+    }
+    return count;
+}
+
+int disk_get_active_device(void) {
+    if (!disk_current_device()) return -1;
+    return g_disk_active_index;
+}
+
+int disk_select_device(int index) {
+    disk_probe_devices();
+    if (index < 0 || index >= ATA_MAX_DEVICES || !g_ata_devices[index].present) return 0;
+    g_disk_active_index = index;
+    return 1;
+}
+
+void cmd_disk_devices(void) {
+    int count = 0;
+
+    disk_probe_devices();
+    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
+        uint32_t size_mb;
+
+        if (!g_ata_devices[i].present) continue;
+        count++;
+        puts(i == g_disk_active_index ? "* " : "  ");
+        puts("disk");
+        putchar('0' + i);
+        puts(" (");
+        puts(g_ata_devices[i].name);
+        puts(") ");
+        size_mb = g_ata_devices[i].total_sectors / 2048U;
+        print_uint(size_mb);
+        puts(" MiB\n");
+    }
+
+    if (!count) puts("disk devices: no ATA disks detected\n");
+}
+
+static int disk_require_active_device(const char *context) {
+    if (disk_current_device()) return 1;
+    puts(context);
+    puts(": no ATA disks detected\n");
+    return 0;
+}
+
 void cmd_disk_format(void) {
-    uint32_t total_sectors = ata_identify_total_sectors();
+    ata_device_t *device = disk_current_device();
+    uint32_t total_sectors = device ? ata_identify_total_sectors(device) : 0;
     uint32_t partition_lba = 2048;
     uint8_t sector[512];
     uint8_t fsinfo[512];
@@ -1032,6 +1194,8 @@ void cmd_disk_format(void) {
     uint32_t volume_sectors;
 
     g_disk_io_error = 0;
+
+    if (!disk_require_active_device("disk format")) return;
 
     if (total_sectors == 0) {
         puts("disk format: unable to identify ATA disk\n");
@@ -1174,6 +1338,7 @@ void cmd_disk_ls(const char *path) {
     int lfn_valid = 0;
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk ls")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1270,6 +1435,7 @@ void cmd_disk_ls(const char *path) {
 }
 
 void disk_prepare_session(void) {
+    (void)disk_current_device();
     fat32_reset_cwd();
     g_disk_io_error = 0;
     g_fat32.mounted = 0;
@@ -1281,6 +1447,7 @@ void cmd_disk_cd(const char *path) {
     fat32_lookup_result_t entry;
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk cd")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1311,6 +1478,7 @@ void cmd_disk_cd(const char *path) {
 
 void cmd_disk_pwd(void) {
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk pwd")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1331,6 +1499,7 @@ void cmd_disk_mkdir(const char *path) {
     int entry_count;
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk mkdir")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1392,6 +1561,7 @@ void cmd_disk_write(const char *path, const char *text) {
     int entry_count;
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk write")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1695,6 +1865,7 @@ void cmd_disk_cat(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk cat")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1747,6 +1918,7 @@ void cmd_disk_rm(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk rm")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1796,10 +1968,12 @@ const char *disk_get_cwd_path(void) {
 }
 
 void cmd_disk_install(void) {
-    uint32_t kernel_start = 0x100000;
-    uint32_t kernel_size = (uint32_t)&_kernel_end - kernel_start;
+    uintptr_t kernel_start = (uintptr_t)_kernel_start;
+    uint32_t kernel_size = (uint32_t)((uintptr_t)_kernel_end - kernel_start);
     uint32_t num_sectors = (kernel_size + 511) / 512;
     uint8_t sector0[512];
+
+    if (!disk_require_active_device("disk install")) return;
 
     puts("Installing OS to disk...");
     putchar('\n');
@@ -1848,6 +2022,7 @@ void cmd_disk_exec(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_active_device("disk exec")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
