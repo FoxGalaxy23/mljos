@@ -6,6 +6,11 @@ typedef struct {
     void (*putchar)(char);
     void (*clear_screen)(void);
     int (*read_line)(char *buf, int maxlen);
+    int (*read_file)(const char *path, char *buf, int maxlen, unsigned int *size_out);
+    int (*write_file)(const char *path, const char *buf, unsigned int size);
+    void (*set_cursor)(int row, int col);
+    void (*putchar_at)(char ch, int row, int col);
+    int (*read_key)(void);
 } mljos_api_t;
 
 #endif
