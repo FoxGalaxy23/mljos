@@ -1,6 +1,20 @@
 #!/bin/bash
 
-# Define required dependencies
+set -e
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$ROOT_DIR/build"
+OBJ_DIR="$BUILD_DIR/obj"
+APP_BUILD_DIR="$BUILD_DIR/apps"
+GENERATED_INCLUDE_DIR="$BUILD_DIR/include"
+ISO_DIR="$BUILD_DIR/isodir"
+KERNEL_BIN="$BUILD_DIR/mljos.bin"
+ISO_IMAGE="$BUILD_DIR/mljOS.iso"
+
+INCLUDE_FLAGS="-I$ROOT_DIR/include -I$GENERATED_INCLUDE_DIR"
+CFLAGS="-m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector"
+APP_CFLAGS="$CFLAGS -fPIC"
+
 DEPS="gcc-i686-linux-gnu binutils-i686-linux-gnu nasm grub-pc-bin grub-common xorriso mtools"
 
 echo "Checking for missing dependencies..."
@@ -16,50 +30,50 @@ if [ -n "$MISSING_DEPS" ]; then
     echo "Attempting to install missing dependencies..."
     sudo apt-get update
     sudo apt-get install -y $MISSING_DEPS
-    if [ $? -ne 0 ]; then
-        echo "Error installing dependencies."
-        exit 1
-    fi
 else
     echo "All dependencies are satisfied."
 fi
 
-echo "Compiling Micro OS..."
+echo "Preparing build directories..."
+mkdir -p "$OBJ_DIR" "$APP_BUILD_DIR" "$GENERATED_INCLUDE_DIR/apps" "$ISO_DIR/boot/grub"
+cp "$ROOT_DIR/config/grub.cfg" "$ISO_DIR/boot/grub/grub.cfg"
 
 echo "Generating bootsector.h..."
-nasm -f bin bootsector.asm -o bootsector.bin
-if [ $? -ne 0 ]; then echo "Failed to assemble bootsector.asm"; exit 1; fi
+nasm -f bin "$ROOT_DIR/boot/bootsector.asm" -o "$BUILD_DIR/bootsector.bin"
 python3 -c '
+import pathlib
 import sys
-with open("bootsector.bin", "rb") as f: data = f.read()
+
+root = pathlib.Path("'"$ROOT_DIR"'")
+build_dir = pathlib.Path("'"$BUILD_DIR"'")
+bootsector_path = build_dir / "bootsector.bin"
+header_path = build_dir / "include" / "bootsector.h"
+data = bootsector_path.read_bytes()
 idx = data.find(b"\xB9\x00\x00\x00\x00")
-if idx == -1: sys.exit(1)
+if idx == -1:
+    sys.exit(1)
 offset = idx + 1
-with open("bootsector.h", "w") as f:
+with header_path.open("w") as f:
     f.write("#ifndef BOOTSECTOR_H\n#define BOOTSECTOR_H\n\n")
     f.write(f"#define BOOTSECTOR_PATCH_OFFSET {offset}\n\n")
     f.write("static const unsigned char bootsector_data[] = {\n")
-    f.write("    " + ", ".join([f"0x{b:02x}" for b in data]) + "\n")
+    f.write("    " + ", ".join(f"0x{b:02x}" for b in data) + "\n")
     f.write("};\n\n#endif\n")
 '
-if [ $? -ne 0 ]; then echo "Failed to generate bootsector.h"; exit 1; fi
 
 echo "Building apps..."
 APP_ELFS=""
-for src in apps/*.c; do
+for src in "$ROOT_DIR"/apps/*.c; do
     app_name=$(basename "$src" .c)
-    app_obj="apps/$app_name.o"
-    app_elf="apps/$app_name.elf"
-    app_bin="apps/$app_name.app"
-    app_hdr="apps/${app_name}_app.h"
+    app_obj="$APP_BUILD_DIR/$app_name.o"
+    app_elf="$APP_BUILD_DIR/$app_name.elf"
+    app_bin="$APP_BUILD_DIR/$app_name.app"
+    app_hdr="$GENERATED_INCLUDE_DIR/apps/${app_name}_app.h"
     app_guard=$(echo "${app_name}_app_h" | tr '[:lower:].' '[:upper:]_')
 
-    i686-linux-gnu-gcc -m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector -fPIC -c "$src" -o "$app_obj"
-    if [ $? -ne 0 ]; then echo "Failed to compile $src"; exit 1; fi
-    i686-linux-gnu-ld -m elf_i386 -T sdk/linker.app.ld "$app_obj" -o "$app_elf"
-    if [ $? -ne 0 ]; then echo "Failed to link $app_elf"; exit 1; fi
+    i686-linux-gnu-gcc $APP_CFLAGS $INCLUDE_FLAGS -c "$src" -o "$app_obj"
+    i686-linux-gnu-ld -m elf_i386 -T "$ROOT_DIR/config/linker.app.ld" "$app_obj" -o "$app_elf"
     i686-linux-gnu-objcopy -O binary "$app_elf" "$app_bin"
-    if [ $? -ne 0 ]; then echo "Failed to convert $app_bin"; exit 1; fi
 
     python3 -c "
 import pathlib
@@ -75,39 +89,29 @@ with header_path.open('w') as f:
     f.write('    ' + ', '.join(f'0x{b:02x}' for b in data) + '\\n')
     f.write('};\\n\\n#endif\\n')
 "
-    if [ $? -ne 0 ]; then echo "Failed to generate $app_hdr"; exit 1; fi
 
     APP_ELFS="$APP_ELFS $app_elf"
 done
 
-# Compile C sources
-C_SOURCES="kernel.c console.c kstring.c rtc.c fs.c disk.c users.c shell.c"
+echo "Compiling kernel sources..."
 OBJECTS=""
-
-for src in $C_SOURCES; do
-    obj="${src%.c}.o"
-    i686-linux-gnu-gcc -m32 -nostdlib -nostdinc -fno-builtin -fno-stack-protector -c "$src" -o "$obj"
-    if [ $? -ne 0 ]; then echo "Failed to compile $src"; exit 1; fi
+for src in "$ROOT_DIR"/src/*.c; do
+    obj="$OBJ_DIR/$(basename "${src%.c}").o"
+    i686-linux-gnu-gcc $CFLAGS $INCLUDE_FLAGS -c "$src" -o "$obj"
     OBJECTS="$OBJECTS $obj"
 done
 
-# Assemble bootloader
-nasm -f elf32 boot.asm -o boot.o
-if [ $? -ne 0 ]; then echo "Failed to assemble boot.asm"; exit 1; fi
+echo "Assembling bootloader..."
+nasm -f elf32 "$ROOT_DIR/boot/boot.asm" -o "$OBJ_DIR/boot.o"
 
-# Link
-i686-linux-gnu-ld -m elf_i386 -T linker.ld boot.o $OBJECTS -o mljos.bin
-if [ $? -ne 0 ]; then echo "Failed to link object files"; exit 1; fi
-
-# Prepare ISO structure
-mkdir -p isodir/boot/grub
-cp mljos.bin isodir/boot/
+echo "Linking kernel..."
+i686-linux-gnu-ld -m elf_i386 -T "$ROOT_DIR/config/linker.ld" "$OBJ_DIR/boot.o" $OBJECTS -o "$KERNEL_BIN"
 
 echo "Creating ISO image..."
-grub-mkrescue -o mljOS.iso isodir
-if [ $? -ne 0 ]; then echo "Failed to create ISO"; exit 1; fi
+cp "$KERNEL_BIN" "$ISO_DIR/boot/mljos.bin"
+grub-mkrescue -o "$ISO_IMAGE" "$ISO_DIR"
 
 echo "Cleaning up temporary files..."
-rm -f $OBJECTS boot.o isodir/boot/mljos.bin mljos.bin $APP_ELFS
+rm -f "$ISO_DIR/boot/mljos.bin" $APP_ELFS
 
-echo "Build successful! Created mljOS.iso"
+echo "Build successful! Created $ISO_IMAGE"

@@ -1,4 +1,4 @@
-#include "../sdk/mljos_api.h"
+#include "sdk/mljos_api.h"
 
 void _start(mljos_api_t *api) {
     char buf[128];

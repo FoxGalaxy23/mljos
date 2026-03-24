@@ -1,4 +1,4 @@
-#include "../sdk/mljos_api.h"
+#include "sdk/mljos_api.h"
 
 #define MAX_LINES 128
 #define MAX_COLS 80
