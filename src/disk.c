@@ -5,6 +5,7 @@
 #include "bootsector.h"
 #include "shell.h"
 #include "sdk/mljos_api.h"
+#include "usb.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -18,6 +19,7 @@ extern uint8_t _kernel_end[];
 #define FAT32_MAX_CLUSTERS   0x0FFFFFEFU
 #define ATA_POLL_TIMEOUT     1000000U
 #define ATA_MAX_DEVICES      4
+#define DISK_MAX_DEVICES     (ATA_MAX_DEVICES + USB_MAX_STORAGE_DEVICES)
 
 typedef struct __attribute__((packed)) {
     uint8_t name[11];
@@ -83,21 +85,38 @@ typedef struct {
     const char *name;
 } ata_device_t;
 
-static fat32_volume_t g_fat32_volumes[ATA_MAX_DEVICES] = {0};
+typedef enum {
+    DISK_BACKEND_NONE = 0,
+    DISK_BACKEND_ATA = 1,
+    DISK_BACKEND_USB = 2
+} disk_backend_type_t;
+
+typedef struct {
+    disk_backend_type_t type;
+    int backend_index;
+    uint32_t total_sectors;
+    int writable;
+    char label[16];
+} disk_device_t;
+
+static fat32_volume_t g_fat32_volumes[DISK_MAX_DEVICES] = {0};
 static ata_device_t g_ata_devices[ATA_MAX_DEVICES] = {
     {0x1F0, 0xE0, 0xA0, 0, 0, "ata0"},
     {0x1F0, 0xF0, 0xB0, 0, 0, "ata1"},
     {0x170, 0xE0, 0xA0, 0, 0, "ata2"},
     {0x170, 0xF0, 0xB0, 0, 0, "ata3"}
 };
+static disk_device_t g_disk_devices[DISK_MAX_DEVICES] = {0};
 static int g_disk_active_index = 0;
 static int g_disk_devices_probed = 0;
+static int g_disk_device_count = 0;
 static int g_disk_io_error = 0;
 
 static int fat32_build_short_name(const char *name, uint8_t out[11]);
 static void disk_probe_devices(void);
 static fat32_volume_t *disk_current_volume(void);
-static ata_device_t *disk_current_device(void);
+static disk_device_t *disk_current_device(void);
+static ata_device_t *disk_current_ata_device(void);
 
 #define g_fat32 (*disk_current_volume())
 
@@ -190,13 +209,13 @@ static int is_fat32_eoc(uint32_t value) {
 }
 
 static fat32_volume_t *disk_current_volume(void) {
-    if (g_disk_active_index < 0 || g_disk_active_index >= ATA_MAX_DEVICES) g_disk_active_index = 0;
+    if (g_disk_active_index < 0 || g_disk_active_index >= DISK_MAX_DEVICES) g_disk_active_index = 0;
     return &g_fat32_volumes[g_disk_active_index];
 }
 
 static int disk_pick_default_device(void) {
-    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
-        if (g_ata_devices[i].present) {
+    for (int i = 0; i < g_disk_device_count; i++) {
+        if (g_disk_devices[i].type != DISK_BACKEND_NONE) {
             g_disk_active_index = i;
             return 1;
         }
@@ -205,15 +224,24 @@ static int disk_pick_default_device(void) {
     return 0;
 }
 
-static ata_device_t *disk_current_device(void) {
+static disk_device_t *disk_current_device(void) {
     disk_probe_devices();
     if (g_disk_active_index >= 0
-        && g_disk_active_index < ATA_MAX_DEVICES
-        && g_ata_devices[g_disk_active_index].present) {
-        return &g_ata_devices[g_disk_active_index];
+        && g_disk_active_index < g_disk_device_count
+        && g_disk_devices[g_disk_active_index].type != DISK_BACKEND_NONE) {
+        return &g_disk_devices[g_disk_active_index];
     }
     if (!disk_pick_default_device()) return 0;
-    return &g_ata_devices[g_disk_active_index];
+    return &g_disk_devices[g_disk_active_index];
+}
+
+static ata_device_t *disk_current_ata_device(void) {
+    disk_device_t *device = disk_current_device();
+
+    if (!device || device->type != DISK_BACKEND_ATA) return 0;
+    if (device->backend_index < 0 || device->backend_index >= ATA_MAX_DEVICES) return 0;
+    if (!g_ata_devices[device->backend_index].present) return 0;
+    return &g_ata_devices[device->backend_index];
 }
 
 static int ata_wait_bsy(uint16_t io_base) {
@@ -314,13 +342,45 @@ static uint32_t ata_identify_total_sectors(ata_device_t *device) {
 static void disk_probe_devices(void) {
     if (g_disk_devices_probed) return;
 
+    g_disk_device_count = 0;
+    kmemset(g_disk_devices, 0, sizeof(g_disk_devices));
     for (int i = 0; i < ATA_MAX_DEVICES; i++) {
         g_ata_devices[i].total_sectors = ata_identify_total_sectors(&g_ata_devices[i]);
         g_ata_devices[i].present = g_ata_devices[i].total_sectors > 0;
-        if (!g_fat32_volumes[i].current_path[0]) {
-            g_disk_active_index = i;
+        if (g_ata_devices[i].present && g_disk_device_count < DISK_MAX_DEVICES) {
+            disk_device_t *device = &g_disk_devices[g_disk_device_count];
+
+            device->type = DISK_BACKEND_ATA;
+            device->backend_index = i;
+            device->total_sectors = g_ata_devices[i].total_sectors;
+            device->writable = 1;
+            strcpy(device->label, g_ata_devices[i].name);
+            if (!g_fat32_volumes[g_disk_device_count].current_path[0]) {
+                g_disk_active_index = g_disk_device_count;
+                fat32_reset_cwd();
+            }
+            g_disk_device_count++;
+        }
+    }
+
+    for (int i = 0; i < usb_storage_device_count() && g_disk_device_count < DISK_MAX_DEVICES; i++) {
+        usb_storage_device_info_t usb_info;
+        disk_device_t *device;
+
+        if (!usb_storage_get_device(i, &usb_info)) continue;
+        if (!usb_info.present || usb_info.sector_size != 512U) continue;
+
+        device = &g_disk_devices[g_disk_device_count];
+        device->type = DISK_BACKEND_USB;
+        device->backend_index = i;
+        device->total_sectors = usb_info.sector_count;
+        device->writable = 0;
+        strcpy(device->label, "usb");
+        if (!g_fat32_volumes[g_disk_device_count].current_path[0]) {
+            g_disk_active_index = g_disk_device_count;
             fat32_reset_cwd();
         }
+        g_disk_device_count++;
     }
 
     g_disk_devices_probed = 1;
@@ -329,7 +389,7 @@ static void disk_probe_devices(void) {
 
 static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
     uint8_t zero[512];
-    ata_device_t *device = disk_current_device();
+    ata_device_t *device = disk_current_ata_device();
 
     if (!device) {
         g_disk_io_error = 1;
@@ -346,11 +406,18 @@ static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
 }
 
 static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
-    return ata_device_read_sector(disk_current_device(), lba, buffer);
+    disk_device_t *device = disk_current_device();
+
+    if (!device) return 0;
+    if (device->type == DISK_BACKEND_ATA) return ata_device_read_sector(disk_current_ata_device(), lba, buffer);
+    if (device->type == DISK_BACKEND_USB) return usb_storage_read_sector(device->backend_index, lba, buffer);
+    return 0;
 }
 
 static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
-    return ata_device_write_sector(disk_current_device(), lba, buffer);
+    ata_device_t *device = disk_current_ata_device();
+    if (!device) return 0;
+    return ata_device_write_sector(device, lba, buffer);
 }
 
 static uint32_t fat32_cluster_to_lba(uint32_t cluster) {
@@ -1127,13 +1194,8 @@ static int fat32_write_entry_chain(const fat32_dir_slot_t *slots, int count, con
 }
 
 int disk_get_device_count(void) {
-    int count = 0;
-
     disk_probe_devices();
-    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
-        if (g_ata_devices[i].present) count++;
-    }
-    return count;
+    return g_disk_device_count;
 }
 
 int disk_get_active_device(void) {
@@ -1143,44 +1205,45 @@ int disk_get_active_device(void) {
 
 int disk_select_device(int index) {
     disk_probe_devices();
-    if (index < 0 || index >= ATA_MAX_DEVICES || !g_ata_devices[index].present) return 0;
+    if (index < 0 || index >= g_disk_device_count || g_disk_devices[index].type == DISK_BACKEND_NONE) return 0;
     g_disk_active_index = index;
     return 1;
 }
 
 void cmd_disk_devices(void) {
-    int count = 0;
-
     disk_probe_devices();
-    for (int i = 0; i < ATA_MAX_DEVICES; i++) {
-        uint32_t size_mb;
+    for (int i = 0; i < g_disk_device_count; i++) {
+        uint32_t size_mb = g_disk_devices[i].total_sectors / 2048U;
 
-        if (!g_ata_devices[i].present) continue;
-        count++;
         puts(i == g_disk_active_index ? "* " : "  ");
         puts("disk");
         putchar('0' + i);
         puts(" (");
-        puts(g_ata_devices[i].name);
+        puts(g_disk_devices[i].label);
         puts(") ");
-        size_mb = g_ata_devices[i].total_sectors / 2048U;
         print_uint(size_mb);
-        puts(" MiB\n");
+        if (!g_disk_devices[i].writable) puts(" MiB ro\n");
+        else puts(" MiB rw\n");
     }
 
-    if (!count) puts("disk devices: no ATA disks detected\n");
+    if (!g_disk_device_count) puts("disk devices: no disks detected\n");
 }
 
 static int disk_require_active_device(const char *context) {
     if (disk_current_device()) return 1;
     puts(context);
-    puts(": no ATA disks detected\n");
+    puts(": no disks detected\n");
     return 0;
 }
 
+static int disk_current_is_writable(void) {
+    disk_device_t *device = disk_current_device();
+    return device && device->writable;
+}
+
 void cmd_disk_format(void) {
-    ata_device_t *device = disk_current_device();
-    uint32_t total_sectors = device ? ata_identify_total_sectors(device) : 0;
+    disk_device_t *device = disk_current_device();
+    uint32_t total_sectors = device ? device->total_sectors : 0;
     uint32_t partition_lba = 2048;
     uint8_t sector[512];
     uint8_t fsinfo[512];
@@ -1196,6 +1259,10 @@ void cmd_disk_format(void) {
     g_disk_io_error = 0;
 
     if (!disk_require_active_device("disk format")) return;
+    if (!device || !device->writable || device->type != DISK_BACKEND_ATA) {
+        puts("disk format: available only for writable ATA disks\n");
+        return;
+    }
 
     if (total_sectors == 0) {
         puts("disk format: unable to identify ATA disk\n");
@@ -1500,6 +1567,10 @@ void cmd_disk_mkdir(const char *path) {
 
     g_disk_io_error = 0;
     if (!disk_require_active_device("disk mkdir")) return;
+    if (!disk_current_is_writable()) {
+        puts("disk mkdir: device is read-only\n");
+        return;
+    }
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1562,6 +1633,10 @@ void cmd_disk_write(const char *path, const char *text) {
 
     g_disk_io_error = 0;
     if (!disk_require_active_device("disk write")) return;
+    if (!disk_current_is_writable()) {
+        puts("disk write: device is read-only\n");
+        return;
+    }
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1827,6 +1902,7 @@ int disk_load_user_config(char *out, int maxlen) {
 
 int disk_save_user_config(const char *text) {
     g_disk_io_error = 0;
+    if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
     if (!fat32_ensure_directory_quiet("/etc")) return 0;
     return disk_write_file_internal("/etc/users.cfg", text ? text : "", text ? strlen(text) : 0);
@@ -1834,12 +1910,14 @@ int disk_save_user_config(const char *text) {
 
 int disk_ensure_directory(const char *path) {
     g_disk_io_error = 0;
+    if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
     return fat32_ensure_directory_quiet(path);
 }
 
 int disk_write_file(const char *path, const char *data, uint32_t size) {
     g_disk_io_error = 0;
+    if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
     return disk_write_file_internal(path, data ? data : "", size);
 }
@@ -1919,6 +1997,10 @@ void cmd_disk_rm(const char *path) {
 
     g_disk_io_error = 0;
     if (!disk_require_active_device("disk rm")) return;
+    if (!disk_current_is_writable()) {
+        puts("disk rm: device is read-only\n");
+        return;
+    }
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
         return;
@@ -1974,6 +2056,10 @@ void cmd_disk_install(void) {
     uint8_t sector0[512];
 
     if (!disk_require_active_device("disk install")) return;
+    if (!disk_current_is_writable()) {
+        puts("disk install: available only for writable ATA disks\n");
+        return;
+    }
 
     puts("Installing OS to disk...");
     putchar('\n');

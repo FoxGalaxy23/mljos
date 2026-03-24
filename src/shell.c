@@ -5,6 +5,7 @@
 #include "io.h"
 #include "kstring.h"
 #include "rtc.h"
+#include "usb.h"
 #include "users.h"
 
 static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out);
@@ -541,6 +542,10 @@ static int parse_decimal_number(const char *text, int *value_out) {
     return 1;
 }
 
+static void print_usb_help(void) {
+    puts("USB: usb, usb controllers, usb ports <controller>, usb reset <controller> <port>, usb probe <controller> <port>, usb storage <controller> <port>, usb read <controller> <port> [lba]\n");
+}
+
 static void mkdir_disk_parents(const char *path) {
     char temp[128];
     int pos = 0;
@@ -590,7 +595,8 @@ static void print_storage_help(void) {
     else puts("Root: ls, cd ram, cd disk, cd /\n");
     puts("Files: ls [path], cd <path>, pwd, mkdir <path>, mkdir -p <path>, rmdir <path>, touch <path>, rm <path>, cat <path>, write <path> <text>, cp <src> <dst>\n");
     puts("Disk: disk devices, disk use <n>, disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
-    puts("System: install, exec, clear, help, shutdown, reboot\n");
+    puts("System: install, exec, usb, clear, help, shutdown, reboot\n");
+    print_usb_help();
 }
 
 static void enter_logged_user_home(void) {
@@ -1124,6 +1130,53 @@ static void handle_command(char *line) {
     } else if (strcmp(argv[0], "help") == 0) {
         puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
         print_storage_help();
+    } else if (strcmp(argv[0], "usb") == 0) {
+        if (argc == 1 || strcmp(argv[1], "controllers") == 0 || strcmp(argv[1], "list") == 0) {
+            cmd_usb_list();
+        } else if (strcmp(argv[1], "ports") == 0) {
+            int controller_index = 0;
+
+            if (argc < 3) puts("usb ports: missing controller index\n");
+            else if (!parse_decimal_number(argv[2], &controller_index)) puts("usb ports: invalid controller index\n");
+            else cmd_usb_ports(controller_index);
+        } else if (strcmp(argv[1], "reset") == 0) {
+            int controller_index = 0;
+            int port_index = 0;
+
+            if (argc < 4) puts("usb reset: missing controller index or port\n");
+            else if (!parse_decimal_number(argv[2], &controller_index)) puts("usb reset: invalid controller index\n");
+            else if (!parse_decimal_number(argv[3], &port_index)) puts("usb reset: invalid port\n");
+            else cmd_usb_reset(controller_index, port_index);
+        } else if (strcmp(argv[1], "probe") == 0) {
+            int controller_index = 0;
+            int port_index = 0;
+
+            if (argc < 4) puts("usb probe: missing controller index or port\n");
+            else if (!parse_decimal_number(argv[2], &controller_index)) puts("usb probe: invalid controller index\n");
+            else if (!parse_decimal_number(argv[3], &port_index)) puts("usb probe: invalid port\n");
+            else cmd_usb_probe(controller_index, port_index);
+        } else if (strcmp(argv[1], "storage") == 0) {
+            int controller_index = 0;
+            int port_index = 0;
+
+            if (argc < 4) puts("usb storage: missing controller index or port\n");
+            else if (!parse_decimal_number(argv[2], &controller_index)) puts("usb storage: invalid controller index\n");
+            else if (!parse_decimal_number(argv[3], &port_index)) puts("usb storage: invalid port\n");
+            else cmd_usb_storage(controller_index, port_index);
+        } else if (strcmp(argv[1], "read") == 0) {
+            int controller_index = 0;
+            int port_index = 0;
+            int lba = 0;
+
+            if (argc < 4) puts("usb read: missing controller index or port\n");
+            else if (!parse_decimal_number(argv[2], &controller_index)) puts("usb read: invalid controller index\n");
+            else if (!parse_decimal_number(argv[3], &port_index)) puts("usb read: invalid port\n");
+            else if (argc > 4 && !parse_decimal_number(argv[4], &lba)) puts("usb read: invalid lba\n");
+            else cmd_usb_read(controller_index, port_index, (uint32_t)lba);
+        } else {
+            puts("usb: unknown command\n");
+            print_usb_help();
+        }
     } else {
         COLOR = COLOR_ERROR;
         puts("Unknown command: ");
