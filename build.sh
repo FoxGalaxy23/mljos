@@ -65,7 +65,7 @@ with open("apps/calc_app.h", "w") as f:
 if [ $? -ne 0 ]; then echo "Failed to generate calc_app.h"; exit 1; fi
 
 # Compile C sources
-C_SOURCES="kernel.c console.c kstring.c rtc.c fs.c disk.c shell.c"
+C_SOURCES="kernel.c console.c kstring.c rtc.c fs.c disk.c users.c shell.c"
 OBJECTS=""
 
 for src in $C_SOURCES; do

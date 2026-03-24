@@ -5,7 +5,7 @@
 #include "io.h"
 #include "kstring.h"
 #include "rtc.h"
-#include "rtc.h"
+#include "users.h"
 
 mljos_api_t os_api = {
     .puts = puts,
@@ -49,25 +49,24 @@ typedef enum shell_location {
 } shell_location_t;
 
 static storage_target_t active_storage = STORAGE_RAM;
-static shell_location_t shell_location = SHELL_ROOT;
+static shell_location_t shell_location = SHELL_STORAGE;
+
+static void handle_command(char *line);
+
+static int shell_disk_primary_mode(void) {
+    return users_system_is_installed();
+}
 
 static const char *storage_name(storage_target_t storage) {
     return storage == STORAGE_DISK ? "disk" : "ram";
 }
 
-static void print_ram_prompt_path(fs_node_t *node) {
-    if (!node || !fs_root) return;
-    if (node == fs_root) {
-        putchar('/');
+static void print_active_path(void) {
+    if (shell_disk_primary_mode() && active_storage == STORAGE_DISK) {
+        puts(disk_get_cwd_path());
         return;
     }
 
-    print_ram_prompt_path(node->parent);
-    if (node->parent != fs_root) putchar('/');
-    puts(node->name);
-}
-
-static void print_active_path(void) {
     if (shell_location == SHELL_ROOT) {
         putchar('/');
         return;
@@ -76,7 +75,7 @@ static void print_active_path(void) {
     puts(storage_name(active_storage));
     putchar(':');
     if (active_storage == STORAGE_DISK) puts(disk_get_cwd_path());
-    else print_ram_prompt_path(current_dir);
+    else fs_print_prompt_path();
 }
 
 static void cmd_time(void) {
@@ -160,12 +159,15 @@ static void push_history(const char *line) {
 static const char *history_get(int pos_from_latest) {
     if (history_count == 0 || pos_from_latest < 0) return NULL;
 
-    int avail = history_count < HISTORY_SIZE ? history_count : HISTORY_SIZE;
-    if (pos_from_latest >= avail) return NULL;
+    {
+        int avail = history_count < HISTORY_SIZE ? history_count : HISTORY_SIZE;
+        int idx;
+        if (pos_from_latest >= avail) return NULL;
 
-    int idx = (history_count - 1 - pos_from_latest) % HISTORY_SIZE;
-    if (idx < 0) idx += HISTORY_SIZE;
-    return history[idx];
+        idx = (history_count - 1 - pos_from_latest) % HISTORY_SIZE;
+        if (idx < 0) idx += HISTORY_SIZE;
+        return history[idx];
+    }
 }
 
 static void clear_input_visual(int prompt_row, int prompt_col) {
@@ -175,7 +177,7 @@ static void clear_input_visual(int prompt_row, int prompt_col) {
     update_cursor();
 }
 
-int read_line(char *buf, int maxlen) {
+static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_history) {
     int len = 0;
     int prompt_row = cursor_row;
     int prompt_col = cursor_col;
@@ -192,182 +194,184 @@ int read_line(char *buf, int maxlen) {
             __asm__ volatile ("nop");
         }
 
-        uint8_t sc = inb(0x60);
+        {
+            uint8_t sc = inb(0x60);
+            char c = 0;
 
-        if (sc == 0x2A || sc == 0x36) {
-            shift_down = 1;
-            continue;
-        }
-        if (sc == 0xAA || sc == 0xB6) {
-            shift_down = 0;
-            continue;
-        }
-        if (sc == 0x3A) {
-            capslock = !capslock;
-            continue;
-        }
+            if (sc == 0x2A || sc == 0x36) {
+                shift_down = 1;
+                continue;
+            }
+            if (sc == 0xAA || sc == 0xB6) {
+                shift_down = 0;
+                continue;
+            }
+            if (sc == 0x3A) {
+                capslock = !capslock;
+                continue;
+            }
 
-        if (sc == 0x48) {
-            if (history_count == 0) continue;
-            if (history_pos < 0) history_pos = 0;
-            else if (history_pos < HISTORY_SIZE - 1) history_pos++;
+            if (sc == 0x48) {
+                if (!allow_history || history_count == 0) continue;
+                if (history_pos < 0) history_pos = 0;
+                else if (history_pos < HISTORY_SIZE - 1) history_pos++;
 
-            const char *h = history_get(history_pos);
-            if (h) {
-                clear_input_visual(prompt_row, prompt_col);
-                int i = 0;
-                while (h[i] && i < maxlen - 1) {
-                    buf[i] = h[i];
-                    putchar_at(h[i], cursor_row, cursor_col++);
+                {
+                    const char *h = history_get(history_pos);
+                    if (h) {
+                        clear_input_visual(prompt_row, prompt_col);
+                        int i = 0;
+                        while (h[i] && i < maxlen - 1) {
+                            buf[i] = h[i];
+                            putchar_at(h[i], cursor_row, cursor_col++);
+                            if (cursor_col >= VGA_COLS) {
+                                cursor_col = 0;
+                                cursor_row++;
+                                scroll_if_needed();
+                            }
+                            i++;
+                        }
+                        len = i;
+                        buf[len] = '\0';
+                        update_cursor();
+                    }
+                }
+                continue;
+            }
+
+            if (sc == 0x50) {
+                if (!allow_history || history_count == 0) continue;
+                if (history_pos <= 0) {
+                    history_pos = -1;
+                    clear_input_visual(prompt_row, prompt_col);
+                    len = 0;
+                    buf[0] = '\0';
+                } else {
+                    const char *h;
+                    history_pos--;
+                    h = history_get(history_pos);
+                    if (h) {
+                        clear_input_visual(prompt_row, prompt_col);
+                        int i = 0;
+                        while (h[i] && i < maxlen - 1) {
+                            buf[i] = h[i];
+                            putchar_at(h[i], cursor_row, cursor_col++);
+                            if (cursor_col >= VGA_COLS) {
+                                cursor_col = 0;
+                                cursor_row++;
+                                scroll_if_needed();
+                            }
+                            i++;
+                        }
+                        len = i;
+                        buf[len] = '\0';
+                        update_cursor();
+                    }
+                }
+                continue;
+            }
+
+            if (sc == 0x4B) {
+                if (len > 0) {
+                    if (cursor_col == 0) {
+                        if (cursor_row > 0) {
+                            cursor_row--;
+                            cursor_col = VGA_COLS - 1;
+                        } else cursor_col = 0;
+                    } else cursor_col--;
+                    update_cursor();
+                }
+                continue;
+            }
+
+            if (sc == 0x4D) {
+                if (len < maxlen - 1) {
+                    if (cursor_col == VGA_COLS - 1) {
+                        cursor_col = 0;
+                        cursor_row++;
+                        scroll_if_needed();
+                    } else cursor_col++;
+                    update_cursor();
+                }
+                continue;
+            }
+
+            if (sc & 0x80) continue;
+
+            if (sc < 128) {
+                int is_letter = ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) || (sc >= 0x2C && sc <= 0x32));
+                int use_shift_map = shift_down;
+                if (capslock && is_letter) use_shift_map = !use_shift_map;
+                c = use_shift_map ? scancode_map_shift[sc] : scancode_map_normal[sc];
+            }
+            if (c == 0) continue;
+
+            if (c == '\n' || c == '\r') {
+                putchar('\n');
+                buf[len] = '\0';
+                if (allow_history && len > 0) push_history(buf);
+                COLOR = old_color;
+                update_cursor();
+                return len;
+            }
+
+            if (c == '\b') {
+                if (len > 0) {
+                    if (cursor_col == 0) {
+                        if (cursor_row > 0) {
+                            cursor_row--;
+                            cursor_col = VGA_COLS - 1;
+                        } else cursor_col = 0;
+                    } else cursor_col--;
+                    putchar_at(' ', cursor_row, cursor_col);
+                    len--;
+                    buf[len] = '\0';
+                    update_cursor();
+                }
+                continue;
+            }
+
+            if (c == '\t') {
+                int t = 4 - (len % 4);
+                while (t-- && len < maxlen - 1) {
+                    buf[len++] = ' ';
+                    putchar_at(' ', cursor_row, cursor_col);
+                    cursor_col++;
                     if (cursor_col >= VGA_COLS) {
                         cursor_col = 0;
                         cursor_row++;
                         scroll_if_needed();
                     }
-                    i++;
                 }
-                len = i;
                 buf[len] = '\0';
                 update_cursor();
+                continue;
             }
-            continue;
-        }
 
-        if (sc == 0x50) {
-            if (history_count == 0) continue;
-            if (history_pos <= 0) {
-                history_pos = -1;
-                clear_input_visual(prompt_row, prompt_col);
-                len = 0;
-                buf[0] = '\0';
-            } else {
-                history_pos--;
-                const char *h = history_get(history_pos);
-                if (h) {
-                    clear_input_visual(prompt_row, prompt_col);
-                    int i = 0;
-                    while (h[i] && i < maxlen - 1) {
-                        buf[i] = h[i];
-                        putchar_at(h[i], cursor_row, cursor_col++);
-                        if (cursor_col >= VGA_COLS) {
-                            cursor_col = 0;
-                            cursor_row++;
-                            scroll_if_needed();
-                        }
-                        i++;
-                    }
-                    len = i;
-                    buf[len] = '\0';
-                    update_cursor();
-                }
-            }
-            continue;
-        }
-
-        if (sc == 0x4B) {
-            if (len > 0) {
-                if (cursor_col == 0) {
-                    if (cursor_row > 0) {
-                        cursor_row--;
-                        cursor_col = VGA_COLS - 1;
-                    } else {
-                        cursor_col = 0;
-                    }
-                } else {
-                    cursor_col--;
-                }
-                update_cursor();
-            }
-            continue;
-        }
-
-        if (sc == 0x4D) {
             if (len < maxlen - 1) {
-                if (cursor_col == VGA_COLS - 1) {
-                    cursor_col = 0;
-                    cursor_row++;
-                    scroll_if_needed();
-                } else {
+                buf[len++] = c;
+                if (!hide_input) {
+                    putchar_at(c, cursor_row, cursor_col);
                     cursor_col++;
-                }
-                update_cursor();
-            }
-            continue;
-        }
-
-        if (sc & 0x80) continue;
-
-        char c = 0;
-        if (sc < 128) {
-            int is_letter = 0;
-            if ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) || (sc >= 0x2C && sc <= 0x32)) {
-                is_letter = 1;
-            }
-            int use_shift_map = shift_down;
-            if (capslock && is_letter) use_shift_map = !use_shift_map;
-            c = use_shift_map ? scancode_map_shift[sc] : scancode_map_normal[sc];
-        }
-        if (c == 0) continue;
-
-        if (c == '\n' || c == '\r') {
-            putchar('\n');
-            buf[len] = '\0';
-            if (len > 0) push_history(buf);
-            COLOR = old_color;
-            update_cursor();
-            return len;
-        }
-
-        if (c == '\b') {
-            if (len > 0) {
-                if (cursor_col == 0) {
-                    if (cursor_row > 0) {
-                        cursor_row--;
-                        cursor_col = VGA_COLS - 1;
-                    } else {
+                    if (cursor_col >= VGA_COLS) {
                         cursor_col = 0;
+                        cursor_row++;
+                        scroll_if_needed();
                     }
-                } else {
-                    cursor_col--;
                 }
-                putchar_at(' ', cursor_row, cursor_col);
-                len--;
                 buf[len] = '\0';
                 update_cursor();
             }
-            continue;
-        }
-
-        if (c == '\t') {
-            int t = 4 - (len % 4);
-            while (t-- && len < maxlen - 1) {
-                buf[len++] = ' ';
-                putchar_at(' ', cursor_row, cursor_col);
-                cursor_col++;
-                if (cursor_col >= VGA_COLS) {
-                    cursor_col = 0;
-                    cursor_row++;
-                    scroll_if_needed();
-                }
-            }
-            buf[len] = '\0';
-            update_cursor();
-            continue;
-        }
-
-        if (len < maxlen - 1) {
-            buf[len++] = c;
-            putchar_at(c, cursor_row, cursor_col);
-            cursor_col++;
-            if (cursor_col >= VGA_COLS) {
-                cursor_col = 0;
-                cursor_row++;
-                scroll_if_needed();
-            }
-            buf[len] = '\0';
-            update_cursor();
         }
     }
+}
+
+int read_line(char *buf, int maxlen) {
+    return read_line_internal(buf, maxlen, 0, 1);
+}
+
+int read_secret_line(char *buf, int maxlen) {
+    return read_line_internal(buf, maxlen, 1, 0);
 }
 
 static int split_args(char *line, char **argv, int maxargv) {
@@ -378,10 +382,9 @@ static int split_args(char *line, char **argv, int maxargv) {
         while (*p == ' ') p++;
         if (!*p) break;
 
-        char *dst = p;
-        argv[argc++] = dst;
-
+        argv[argc++] = p;
         if (*p == '"') {
+            char *dst = p;
             p++;
             while (*p && *p != '"') {
                 if (*p == '\\' && p[1]) p++;
@@ -390,19 +393,16 @@ static int split_args(char *line, char **argv, int maxargv) {
             if (*p == '"') p++;
             *dst = '\0';
         } else {
+            char *dst = p;
             while (*p && *p != ' ') {
                 if (*p == '\\' && p[1]) p++;
                 *dst++ = *p++;
             }
             if (*p == ' ') {
-                char *space = p;
                 *dst = '\0';
-                p = space + 1;
-            } else {
-                *dst = '\0';
-            }
+                p++;
+            } else *dst = '\0';
         }
-        while (*p == ' ') p++;
     }
     return argc;
 }
@@ -415,42 +415,142 @@ static void join_args(char *out, int out_size, char **argv, int start, int argc)
         if (i > start && pos < out_size - 1) out[pos++] = ' ';
         for (int j = 0; argv[i][j] && pos < out_size - 1; j++) out[pos++] = argv[i][j];
     }
-
     out[pos] = '\0';
 }
 
+static int parse_octal_mode(const char *text, uint16_t *mode_out) {
+    uint16_t value = 0;
+    int len = 0;
+
+    if (!text || !text[0]) return 0;
+    while (text[len]) {
+        if (text[len] < '0' || text[len] > '7') return 0;
+        value = (uint16_t)((value << 3) | (text[len] - '0'));
+        len++;
+    }
+    if (len > 4) return 0;
+    *mode_out = value;
+    return 1;
+}
+
+static void mkdir_disk_parents(const char *path) {
+    char temp[128];
+    int pos = 0;
+    int start = 0;
+
+    if (!path || !path[0]) {
+        puts("mkdir: missing operand\n");
+        return;
+    }
+
+    if (path[0] == '/') temp[pos++] = '/';
+    while (path[start] == '/') start++;
+
+    for (int i = start;; i++) {
+        char c = path[i];
+        if (c == '/' || c == '\0') {
+            temp[pos] = '\0';
+            if (pos > 0 && strcmp(temp, "/") != 0) cmd_disk_mkdir(temp);
+            if (c == '\0') break;
+            if (pos < (int)sizeof(temp) - 1 && temp[pos - 1] != '/') temp[pos++] = '/';
+            continue;
+        }
+        if (pos < (int)sizeof(temp) - 1) temp[pos++] = c;
+    }
+}
+
+static void cmd_mkdir_active(const char *path, int create_parents);
+static void cmd_rmdir_active(const char *path);
+static void run_install_wizard(void);
+
 static void print_prompt(void) {
+    const user_account_t *user = users_current();
     uint8_t old_color = COLOR;
+
     COLOR = COLOR_PROMPT;
-    puts("root@mljOS:");
+    puts(user ? user->username : "root");
+    puts("@mljOS:");
     print_active_path();
-    puts("# ");
+    puts(users_is_root() ? "# " : "$ ");
     COLOR = old_color;
 }
 
 static void print_storage_help(void) {
-    puts("Root: ls, cd ram, cd disk, cd /\n");
-    puts("Files: ls [path], cd <path>, pwd, mkdir <path>, rm <path>, cat <path>, write <path> <text>\n");
-    puts("RAM only: touch <name>, cp <src> <dst>\n");
-    puts("Disk only: disk format\n");
-    puts("Legacy aliases: disk ls/cd/pwd/mkdir/write/cat/rm\n");
-    puts("Quotes: write \"My Folder/File.txt\" \"hello world\"\n");
-    puts("System: install (installs OS to disk)\n");
+    puts("Users: login, logout, whoami, id [user], users, groups [user], su <user>, sudo <cmd>\n");
+    puts("Admin: useradd <name> <pass> [admin], userdel <name>, passwd [user], chmod <mode> <path>, chown <user> <path>, umask [mode]\n");
+    if (shell_disk_primary_mode()) puts("Root: disk-backed session, cd <path>, cd /, pwd\n");
+    else puts("Root: ls, cd ram, cd disk, cd /\n");
+    puts("Files: ls [path], cd <path>, pwd, mkdir <path>, mkdir -p <path>, rmdir <path>, touch <path>, rm <path>, cat <path>, write <path> <text>, cp <src> <dst>\n");
+    puts("Disk: disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
+    puts("System: install, exec, clear, help, shutdown, reboot\n");
+}
+
+static void enter_logged_user_home(void) {
+    const user_account_t *user = users_current();
+
+    if (shell_disk_primary_mode()) {
+        active_storage = STORAGE_DISK;
+        shell_location = SHELL_STORAGE;
+        disk_prepare_session();
+        if (user && user->home[0]) {
+            (void)disk_ensure_directory(user->home);
+            cmd_disk_cd(user->home);
+        } else {
+            cmd_disk_cd("/");
+        }
+        return;
+    }
+
+    active_storage = STORAGE_RAM;
+    shell_location = SHELL_STORAGE;
+    fs_enter_home();
 }
 
 static void enter_storage(storage_target_t storage) {
+    if (shell_disk_primary_mode() && storage == STORAGE_RAM) {
+        puts("cd: ram storage is disabled in installed mode\n");
+        return;
+    }
     active_storage = storage;
     shell_location = SHELL_STORAGE;
     if (storage == STORAGE_DISK) disk_prepare_session();
+    else fs_enter_home();
 }
 
 static int is_at_storage_root(void) {
+    if (shell_disk_primary_mode()) return 0;
     if (shell_location != SHELL_STORAGE) return 0;
     if (active_storage == STORAGE_DISK) return strcmp(disk_get_cwd_path(), "/") == 0;
-    return current_dir == fs_root;
+    return strcmp(storage_name(active_storage), "ram") == 0 && current_dir == fs_root;
+}
+
+static void reset_user_session(void) {
+    enter_logged_user_home();
+}
+
+static void do_login(void) {
+    char username[32];
+    char password[32];
+
+    while (1) {
+        puts("login: ");
+        read_line(username, sizeof(username));
+        puts("password: ");
+        read_secret_line(password, sizeof(password));
+        if (users_login(username, password)) {
+            reset_user_session();
+            puts("Login successful\n\n");
+            return;
+        }
+        puts("Login incorrect\n\n");
+    }
 }
 
 static void cmd_ls_active(const char *path) {
+    if (shell_disk_primary_mode()) {
+        cmd_disk_ls(path);
+        return;
+    }
     if (shell_location == SHELL_ROOT) {
         puts("ram\n");
         puts("disk\n");
@@ -462,15 +562,26 @@ static void cmd_ls_active(const char *path) {
 
 static void cmd_cd_active(const char *path) {
     if (!path || !path[0]) {
-        puts("cd: missing operand\n");
+        if (shell_disk_primary_mode()) enter_logged_user_home();
+        else if (shell_location == SHELL_STORAGE && active_storage == STORAGE_RAM) cmd_cd(NULL);
+        else puts("cd: missing operand\n");
         return;
     }
 
     if (strcmp(path, "/") == 0) {
+        if (shell_disk_primary_mode()) {
+            cmd_disk_cd("/");
+            return;
+        }
         if (shell_location == SHELL_ROOT) return;
         if (active_storage == STORAGE_DISK) cmd_disk_cd("/");
         else cmd_cd("/");
         shell_location = SHELL_ROOT;
+        return;
+    }
+
+    if (shell_disk_primary_mode()) {
+        cmd_disk_cd(path);
         return;
     }
 
@@ -491,6 +602,10 @@ static void cmd_cd_active(const char *path) {
 }
 
 static void cmd_pwd_active(void) {
+    if (shell_disk_primary_mode()) {
+        cmd_disk_pwd();
+        return;
+    }
     if (shell_location == SHELL_ROOT) {
         puts("/\n");
         return;
@@ -499,21 +614,46 @@ static void cmd_pwd_active(void) {
     puts(storage_name(active_storage));
     putchar(':');
     if (active_storage == STORAGE_DISK) cmd_disk_pwd();
-    else {
-        cmd_pwd();
-    }
+    else cmd_pwd();
 }
 
-static void cmd_mkdir_active(const char *path) {
+static void cmd_mkdir_active(const char *path, int create_parents) {
+    if (shell_disk_primary_mode()) {
+        if (create_parents) mkdir_disk_parents(path);
+        else cmd_disk_mkdir(path);
+        return;
+    }
     if (shell_location == SHELL_ROOT) {
         puts("mkdir: select a storage first with cd ram or cd disk\n");
         return;
     }
-    if (active_storage == STORAGE_DISK) cmd_disk_mkdir(path);
-    else cmd_mkdir(path);
+    if (active_storage == STORAGE_DISK) {
+        if (create_parents) mkdir_disk_parents(path);
+        else cmd_disk_mkdir(path);
+    } else {
+        if (create_parents) cmd_mkdir_p(path);
+        else cmd_mkdir(path);
+    }
+}
+
+static void cmd_rmdir_active(const char *path) {
+    if (shell_disk_primary_mode()) {
+        cmd_disk_rm(path);
+        return;
+    }
+    if (shell_location == SHELL_ROOT) {
+        puts("rmdir: select a storage first with cd ram or cd disk\n");
+        return;
+    }
+    if (active_storage == STORAGE_DISK) cmd_disk_rm(path);
+    else cmd_rmdir(path);
 }
 
 static void cmd_rm_active(const char *path) {
+    if (shell_disk_primary_mode()) {
+        cmd_disk_rm(path);
+        return;
+    }
     if (shell_location == SHELL_ROOT) {
         puts("rm: select a storage first with cd ram or cd disk\n");
         return;
@@ -523,6 +663,10 @@ static void cmd_rm_active(const char *path) {
 }
 
 static void cmd_cat_active(const char *path) {
+    if (shell_disk_primary_mode()) {
+        cmd_disk_cat(path);
+        return;
+    }
     if (shell_location == SHELL_ROOT) {
         puts("cat: select a storage first with cd ram or cd disk\n");
         return;
@@ -532,6 +676,10 @@ static void cmd_cat_active(const char *path) {
 }
 
 static void cmd_write_active(const char *path, const char *text) {
+    if (shell_disk_primary_mode()) {
+        cmd_disk_write(path, text);
+        return;
+    }
     if (shell_location == SHELL_ROOT) {
         puts("write: select a storage first with cd ram or cd disk\n");
         return;
@@ -540,21 +688,179 @@ static void cmd_write_active(const char *path, const char *text) {
     else cmd_write(path, text);
 }
 
+static void handle_sudo(char **argv, int argc) {
+    char command[128];
+    char password[32];
+
+    if (argc < 2) {
+        puts("sudo: missing command\n");
+        return;
+    }
+    if (users_is_root()) {
+        join_args(command, sizeof(command), argv, 1, argc);
+        handle_command(command);
+        return;
+    }
+    if (!users_current_can_sudo()) {
+        puts("sudo: user is not in sudoers\n");
+        return;
+    }
+
+    puts("sudo password: ");
+    read_secret_line(password, sizeof(password));
+    if (!users_begin_sudo(password)) {
+        puts("sudo: authentication failed\n");
+        return;
+    }
+
+    join_args(command, sizeof(command), argv, 1, argc);
+    handle_command(command);
+    users_end_sudo();
+}
+
+static void handle_su(char **argv, int argc) {
+    char password[32];
+
+    if (argc < 2) {
+        puts("su: missing user\n");
+        return;
+    }
+
+    puts("password: ");
+    read_secret_line(password, sizeof(password));
+    if (!users_su(argv[1], password)) {
+        puts("su: authentication failed\n");
+        return;
+    }
+
+    reset_user_session();
+}
+
+static void handle_passwd(char **argv, int argc) {
+    const user_account_t *user = users_current();
+    const char *target = NULL;
+    char password[32];
+
+    if (argc == 1) {
+        target = user ? user->username : NULL;
+    } else if (argc == 2) {
+        if (!users_can_manage_accounts()) {
+            puts("passwd: only root can change another user's password\n");
+            return;
+        }
+        target = argv[1];
+    } else {
+        puts("passwd: usage passwd [user]\n");
+        return;
+    }
+
+    puts("new password: ");
+    read_secret_line(password, sizeof(password));
+    if (!users_set_password(target, password)) puts("passwd: unable to update password\n");
+    else puts("passwd: password updated\n");
+}
+
+static void handle_useradd(char **argv, int argc) {
+    uint8_t role = USER_ROLE_USER;
+    int can_sudo = 0;
+
+    if (!users_can_manage_accounts()) {
+        puts("useradd: only root can add users\n");
+        return;
+    }
+    if (argc < 3) {
+        puts("useradd: usage useradd <name> <pass> [admin]\n");
+        return;
+    }
+    if (argc > 3 && strcmp(argv[3], "admin") == 0) {
+        role = USER_ROLE_ADMIN;
+        can_sudo = 1;
+    }
+
+    if (!users_add(argv[1], argv[2], role, can_sudo)) puts("useradd: failed to create user\n");
+    else puts("useradd: user created\n");
+}
+
+static void handle_userdel(char **argv, int argc) {
+    if (!users_can_manage_accounts()) {
+        puts("userdel: only root can delete users\n");
+        return;
+    }
+    if (argc < 2) {
+        puts("userdel: usage userdel <name>\n");
+        return;
+    }
+    if (!users_remove(argv[1])) puts("userdel: failed to remove user\n");
+    else puts("userdel: user removed\n");
+}
+
+static void handle_umask(char **argv, int argc) {
+    uint16_t mode;
+    uint16_t current = fs_get_umask();
+    char a = '0' + (char)((current >> 6) & 0x7);
+    char b = '0' + (char)((current >> 3) & 0x7);
+    char c = '0' + (char)(current & 0x7);
+
+    if (argc < 2) {
+        putchar(a);
+        putchar(b);
+        putchar(c);
+        putchar('\n');
+        return;
+    }
+    if (!parse_octal_mode(argv[1], &mode)) {
+        puts("umask: use octal mode like 022 or 077\n");
+        return;
+    }
+    fs_set_umask(mode);
+}
+
+static void run_install_wizard(void) {
+    char username[32];
+    char user_password[32];
+    char root_password[32];
+    char autologin_answer[8];
+    int enable_autologin = 0;
+
+    puts("installer user name: ");
+    read_line(username, sizeof(username));
+    puts("installer user password: ");
+    read_secret_line(user_password, sizeof(user_password));
+    puts("new root password: ");
+    read_secret_line(root_password, sizeof(root_password));
+    puts("enable autologin after install? (y/n): ");
+    read_line(autologin_answer, sizeof(autologin_answer));
+    enable_autologin = autologin_answer[0] == 'y' || autologin_answer[0] == 'Y';
+
+    if (!users_setup_install_owner(username, user_password, root_password, enable_autologin)) {
+        puts("install: unable to prepare user accounts\n");
+        return;
+    }
+
+    cmd_disk_install();
+    if (!fs_sync_to_disk()) {
+        puts("install: warning, failed to copy RAM filesystem to FAT32\n");
+        return;
+    }
+    users_persist();
+    puts("install: filesystem and users copied to disk\n");
+}
+
 static void handle_command(char *line) {
     uint8_t old_color = COLOR;
-    COLOR = COLOR_DEFAULT;
+    char line_copy[128];
+    char *argv[12];
+    char joined[128];
+    int argc;
 
+    COLOR = COLOR_DEFAULT;
     if (line[0] == '\0') {
         COLOR = old_color;
         return;
     }
 
-    char line_copy[128];
-    char *argv[10];
-    char joined[128];
     strcpy(line_copy, line);
-
-    int argc = split_args(line_copy, argv, 10);
+    argc = split_args(line_copy, argv, 12);
     if (argc == 0) {
         COLOR = old_color;
         return;
@@ -565,19 +871,52 @@ static void handle_command(char *line) {
     } else if (strcmp(argv[0], "date") == 0) {
         cmd_date();
     } else if (strcmp(argv[0], "echo") == 0) {
-        if (argc > 1) {
-            join_args(joined, sizeof(joined), argv, 1, argc);
-            cmd_echo(joined);
-        }
-        else cmd_echo("");
+        if (argc > 1) join_args(joined, sizeof(joined), argv, 1, argc);
+        else joined[0] = '\0';
+        cmd_echo(joined);
     } else if (strcmp(argv[0], "reboot") == 0) {
         cmd_reboot();
     } else if (strcmp(argv[0], "shutdown") == 0) {
         cmd_shutdown();
     } else if (strcmp(argv[0], "clear") == 0) {
         clear_screen();
+    } else if (strcmp(argv[0], "login") == 0 || strcmp(argv[0], "logout") == 0) {
+        do_login();
+    } else if (strcmp(argv[0], "whoami") == 0) {
+        const user_account_t *user = users_current();
+        puts(user ? user->username : "unknown");
+        putchar('\n');
+    } else if (strcmp(argv[0], "id") == 0) {
+        users_print_id(argc > 1 ? argv[1] : NULL);
+    } else if (strcmp(argv[0], "groups") == 0) {
+        users_print_groups(argc > 1 ? argv[1] : NULL);
+    } else if (strcmp(argv[0], "users") == 0) {
+        users_list();
+    } else if (strcmp(argv[0], "su") == 0) {
+        handle_su(argv, argc);
+    } else if (strcmp(argv[0], "sudo") == 0) {
+        handle_sudo(argv, argc);
+    } else if (strcmp(argv[0], "useradd") == 0) {
+        handle_useradd(argv, argc);
+    } else if (strcmp(argv[0], "userdel") == 0) {
+        handle_userdel(argv, argc);
+    } else if (strcmp(argv[0], "passwd") == 0) {
+        handle_passwd(argv, argc);
+    } else if (strcmp(argv[0], "umask") == 0) {
+        handle_umask(argv, argc);
+    } else if (strcmp(argv[0], "chmod") == 0) {
+        if (shell_disk_primary_mode()) puts("chmod: FAT32 metadata is not implemented for installed mode\n");
+        else if (shell_location == SHELL_ROOT || active_storage != STORAGE_RAM) puts("chmod: available only in ram storage\n");
+        else if (argc > 2) cmd_chmod(argv[1], argv[2]);
+        else puts("chmod: usage chmod <mode> <path>\n");
+    } else if (strcmp(argv[0], "chown") == 0) {
+        if (shell_disk_primary_mode()) puts("chown: FAT32 metadata is not implemented for installed mode\n");
+        else if (shell_location == SHELL_ROOT || active_storage != STORAGE_RAM) puts("chown: available only in ram storage\n");
+        else if (argc > 2) cmd_chown(argv[1], argv[2]);
+        else puts("chown: usage chown <user> <path>\n");
     } else if (strcmp(argv[0], "install") == 0) {
-        cmd_disk_install();
+        if (!users_effective_is_root()) puts("install: requires root\n");
+        else run_install_wizard();
     } else if (strcmp(argv[0], "ls") == 0) {
         if (argc > 1) cmd_ls_active(argv[1]);
         else cmd_ls_active(NULL);
@@ -586,10 +925,18 @@ static void handle_command(char *line) {
     } else if (strcmp(argv[0], "pwd") == 0) {
         cmd_pwd_active();
     } else if (strcmp(argv[0], "mkdir") == 0) {
-        if (argc > 1) cmd_mkdir_active(argv[1]);
+        if (argc > 2 && strcmp(argv[1], "-p") == 0) cmd_mkdir_active(argv[2], 1);
+        else if (argc > 1) cmd_mkdir_active(argv[1], 0);
         else puts("mkdir: missing operand\n");
+    } else if (strcmp(argv[0], "rmdir") == 0) {
+        if (argc > 1) cmd_rmdir_active(argv[1]);
+        else puts("rmdir: missing operand\n");
     } else if (strcmp(argv[0], "touch") == 0) {
-        if (shell_location == SHELL_ROOT) puts("touch: select a storage first with cd ram\n");
+        if (shell_disk_primary_mode()) {
+            if (argc > 1) {
+                if (!disk_touch_file(argv[1])) puts("touch: unable to create file on disk\n");
+            } else puts("touch: missing operand\n");
+        } else if (shell_location == SHELL_ROOT) puts("touch: select a storage first with cd ram\n");
         else if (active_storage == STORAGE_DISK) puts("touch: available only for ram storage\n");
         else if (argc > 1) cmd_touch(argv[1]);
         else puts("touch: missing operand\n");
@@ -600,7 +947,11 @@ static void handle_command(char *line) {
         if (argc > 1) cmd_cat_active(argv[1]);
         else puts("cat: missing operand\n");
     } else if (strcmp(argv[0], "cp") == 0) {
-        if (shell_location == SHELL_ROOT) puts("cp: select a storage first with cd ram\n");
+        if (shell_disk_primary_mode()) {
+            if (argc > 2) {
+                if (!disk_copy_file(argv[1], argv[2])) puts("cp: failed to copy file on disk\n");
+            } else puts("cp: missing operands\n");
+        } else if (shell_location == SHELL_ROOT) puts("cp: select a storage first with cd ram\n");
         else if (active_storage == STORAGE_DISK) puts("cp: available only for ram storage\n");
         else if (argc > 2) cmd_cp(argv[1], argv[2]);
         else puts("cp: missing operands\n");
@@ -608,12 +959,13 @@ static void handle_command(char *line) {
         if (argc > 2) {
             join_args(joined, sizeof(joined), argv, 2, argc);
             cmd_write_active(argv[1], joined);
-        }
-        else puts("write: missing file or text\n");
+        } else puts("write: missing file or text\n");
     } else if (strcmp(argv[0], "disk") == 0) {
         if (argc < 2) puts("disk: missing command (format, ls, cd, pwd, mkdir, write, cat, rm)\n");
-        else if (strcmp(argv[1], "format") == 0) cmd_disk_format();
-        else if (strcmp(argv[1], "ls") == 0) {
+        else if (strcmp(argv[1], "format") == 0) {
+            if (!users_effective_is_root()) puts("disk format: requires root\n");
+            else cmd_disk_format();
+        } else if (strcmp(argv[1], "ls") == 0) {
             if (argc > 2) cmd_disk_ls(argv[2]);
             else cmd_disk_ls(NULL);
         } else if (strcmp(argv[1], "cd") == 0) {
@@ -624,8 +976,7 @@ static void handle_command(char *line) {
         } else if (strcmp(argv[1], "mkdir") == 0) {
             if (argc > 2) cmd_disk_mkdir(argv[2]);
             else puts("disk mkdir: missing path\n");
-        }
-        else if (strcmp(argv[1], "rm") == 0) {
+        } else if (strcmp(argv[1], "rm") == 0) {
             if (argc > 2) cmd_disk_rm(argv[2]);
             else puts("disk rm: missing path\n");
         } else if (strcmp(argv[1], "cat") == 0) {
@@ -635,20 +986,15 @@ static void handle_command(char *line) {
             if (argc > 3) {
                 join_args(joined, sizeof(joined), argv, 3, argc);
                 cmd_disk_write(argv[2], joined);
-            }
-            else puts("disk write: missing path or text\n");
-        } else {
-            puts("disk: unknown command\n");
-        }
+            } else puts("disk write: missing path or text\n");
+        } else puts("disk: unknown command\n");
     } else if (strcmp(argv[0], "exec") == 0) {
         if (argc > 1) {
-            if (active_storage == STORAGE_DISK) cmd_disk_exec(argv[1]);
+            if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) cmd_disk_exec(argv[1]);
             else cmd_ram_exec(argv[1]);
-        } else {
-            puts("exec: missing application name\n");
-        }
+        } else puts("exec: missing application name\n");
     } else if (strcmp(argv[0], "help") == 0) {
-        puts("Commands: time, date, echo, shutdown, reboot, clear, exec, help\n");
+        puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
         print_storage_help();
     } else {
         COLOR = COLOR_ERROR;
@@ -662,17 +1008,32 @@ static void handle_command(char *line) {
 }
 
 void shell_run(void) {
+    users_init();
+    (void)users_load_from_disk();
     fs_init();
+    users_bootstrap_fs();
+
     clear_screen();
     puts("Welcome to mljOS by foxgalaxy23\n");
-    puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
+    puts("Accounts are loaded from disk when available. Fallback users: root/root and guest/guest\n");
+    if (shell_disk_primary_mode()) puts("Installed mode detected: user shell is disk-backed and ram storage is hidden from normal navigation.\n");
+    else puts("Live mode detected: ram storage stays primary and disk is optional.\n");
     print_storage_help();
     putchar('\n');
 
-    char linebuf[128];
-    while (1) {
-        print_prompt();
-        (void)read_line(linebuf, sizeof(linebuf));
-        handle_command(linebuf);
+    if (users_try_autologin()) {
+        reset_user_session();
+        puts("Autologin enabled\n\n");
+    } else {
+        do_login();
+    }
+
+    {
+        char linebuf[128];
+        while (1) {
+            print_prompt();
+            (void)read_line(linebuf, sizeof(linebuf));
+            handle_command(linebuf);
+        }
     }
 }

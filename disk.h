@@ -15,5 +15,12 @@ const char *disk_get_cwd_path(void);
 void disk_prepare_session(void);
 void cmd_disk_install(void);
 void cmd_disk_exec(const char *path);
+int disk_load_user_config(char *out, int maxlen);
+int disk_save_user_config(const char *text);
+int disk_ensure_directory(const char *path);
+int disk_write_file(const char *path, const char *data, uint32_t size);
+int disk_read_file(const char *path, char *out, int maxlen, uint32_t *size_out);
+int disk_touch_file(const char *path);
+int disk_copy_file(const char *src_path, const char *dst_path);
 
 #endif
