@@ -3,7 +3,9 @@
 set -e
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BUILD_DIR="$ROOT_DIR/build"
+# Allow overriding output directory to avoid permission issues.
+# Example: MLJOS_BUILD_DIR=/tmp/mljos-build ./build.sh
+BUILD_DIR="${MLJOS_BUILD_DIR:-$ROOT_DIR/build}"
 OBJ_DIR="$BUILD_DIR/obj"
 APP_BUILD_DIR="$BUILD_DIR/apps"
 GENERATED_INCLUDE_DIR="$BUILD_DIR/include"
@@ -92,9 +94,6 @@ with header_path.open('w') as f:
 
     APP_ELFS="$APP_ELFS $app_elf"
 done
-
-# Special case for mcrunner (it is a stub, but we build it like an app)
-# It's already included in the loop above because it's in apps/*.c
 
 echo "Compiling kernel sources..."
 OBJECTS=""

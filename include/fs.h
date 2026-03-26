@@ -30,7 +30,6 @@ extern fs_node_t *current_dir;
 void fs_init(void);
 void fs_enter_home(void);
 void fs_print_prompt_path(void);
-void fs_get_cwd_path(char *out, int out_size);
 void fs_ensure_dir(const char *path, uint16_t uid, uint16_t gid, uint16_t mode);
 int fs_sync_to_disk(void);
 uint16_t fs_get_umask(void);
