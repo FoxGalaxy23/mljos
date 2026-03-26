@@ -6,6 +6,7 @@
 #include "users.h"
 #include "apps/calc_app.h"
 #include "apps/edit_app.h"
+#include "apps/microcoder_app.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -440,6 +441,12 @@ void fs_init(void) {
     if (edit) {
         edit->size = edit_app_size;
         edit->content = (char*)edit_app_data;
+    }
+
+    fs_node_t *microcoder = fs_create_node(apps_dir ? apps_dir : fs_root, "microcoder.app", FS_FILE, 0, 0, 0755);
+    if (microcoder) {
+        microcoder->size = microcoder_app_size;
+        microcoder->content = (char*)microcoder_app_data;
     }
 }
 

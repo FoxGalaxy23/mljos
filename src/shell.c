@@ -1242,9 +1242,9 @@ static void handle_command(char *line) {
             join_args(joined, sizeof(joined), argv, 2, argc);
             cmd_write_active(argv[1], joined);
         } else puts("write: missing file or text\n");
-    } else if (strcmp(argv[0], "edit") == 0) {
+    } else if (strcmp(argv[0], "edit") == 0 || strcmp(argv[0], "microcoder") == 0) {
         if (argc > 1) {
-            // Allow `edit "some path.txt"` by re-joining all remaining args.
+            // Allow "some path.txt" by re-joining all remaining args.
             join_args(joined, sizeof(joined), argv, 1, argc);
             strncpy(g_edit_open_path, joined, sizeof(g_edit_open_path));
             g_edit_open_path[sizeof(g_edit_open_path) - 1] = '\0';
@@ -1252,10 +1252,9 @@ static void handle_command(char *line) {
             g_edit_open_path[0] = '\0';
         }
 
-        shell_exec_app_command("edit");
+        shell_exec_app_command(argv[0]);
 
         // Clear after launching app to avoid leaking path into the next run
-        // (especially when opening is triggered without an explicit argument).
         g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "disk") == 0) {
         if (argc < 2) puts("disk: missing command (devices, use, format, ls, cd, pwd, mkdir, write, cat, rm)\n");
