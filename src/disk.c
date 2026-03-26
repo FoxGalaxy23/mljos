@@ -1719,8 +1719,8 @@ int disk_list_dir_file_names(const char *path, char *out, int out_size) {
                 if (item.entry.attr & FAT32_ATTR_DIRECTORY) continue;
                 if (!item.display_name[0]) continue;
 
-                if (pos > 0 && pos < out_size - 1) out[pos++] = '\n';
                 for (int i = 0; item.display_name[i] && pos < out_size - 1; i++) out[pos++] = item.display_name[i];
+                if (pos < out_size - 1) out[pos++] = '\0';
                 if (pos >= out_size - 1) {
                     out[pos] = '\0';
                     return 1;
