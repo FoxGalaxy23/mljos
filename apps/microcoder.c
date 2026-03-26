@@ -10,46 +10,70 @@
 
 #include "sdk/mljos_api.h"
 
+// Prototypes
+static int compile_and_run(mljos_api_t *api, const char *program_text, const char *output_path);
+static int strlen(const char *s);
+static void strcpy(char *dst, const char *src);
+
+#define MAX_NODES 512
+#define MAX_CODE 1000
+#define MAX_STACK 256
+#define MAX_PROGRAM_LEN 4096
+
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
 
-#define MAX_LINE_LEN 256
-#define MAX_PROGRAM_LEN 4096
+void _start(mljos_api_t *api) {
+    if (!api || !api->open_path || !api->open_path[0]) {
+        if (api) {
+            api->puts("Tiny-C microcoder for mljOS\n");
+            api->puts("Usage: microcoder <file.tc> [output.app]\n");
+        }
+        return;
+    }
+    char *file_path = api->open_path;
+    char *output_path = NULL;
 
-#define MAX_NODES 4096
-#define MAX_CODE 1000
-#define MAX_STACK 1000
+    static char path_buf[128];
+    strcpy(path_buf, api->open_path);
+    char *p = path_buf;
+    while (*p && *p != ' ') p++;
+    if (*p == ' ') {
+        *p = '\0';
+        file_path = path_buf;
+        output_path = p + 1;
+        while (*output_path == ' ') output_path++;
+    }
 
-// ----- Lexer -----
-enum {
-    DO_SYM,
-    ELSE_SYM,
-    IF_SYM,
-    WHILE_SYM,
-    LBRA,
-    RBRA,
-    LPAR,
-    RPAR,
-    PLUS,
-    MINUS,
-    LESS,
-    SEMI,
-    EQUAL,
-    INT,
-    ID,
-    EOI
-};
+    char program_text[4096];
+    unsigned int size = 0;
 
-static const char *g_src;
-static int g_pos;
-static int g_ch;
-static int g_sym;
-static int g_int_val;
-static char g_id_name[32];
+    if (api->read_file(file_path, program_text, sizeof(program_text) - 1, &size)) {
+        program_text[size] = '\0';
+        compile_and_run(api, program_text, output_path);
+    } else {
+        api->puts("Tiny-C error: could not read file '");
+        api->puts(file_path);
+        api->puts("'\n");
+    }
+}
 
-static int g_error;
-static const char *g_error_msg;
+// ----- Global helpers -----
+static int strlen(const char *s) {
+    int i = 0;
+    while (s && s[i]) i++;
+    return i;
+}
+
+static void strcpy(char *dst, const char *src) {
+    int i = 0;
+    while (src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
 
 static int streq(const char *a, const char *b) {
     int i = 0;
@@ -59,6 +83,23 @@ static int streq(const char *a, const char *b) {
     }
     return (!a || !b) ? 0 : (a[i] == b[i]);
 }
+
+// ----- Lexer -----
+enum {
+    DO_SYM, ELSE_SYM, IF_SYM, WHILE_SYM, LBRA, RBRA, LPAR, RPAR,
+    PLUS, MINUS, LESS, SEMI, EQUAL, GREATER, MUL, DIV, MOD,
+    GE, LE, EQ, NE, INT, ID, FOR_SYM, PRINT_SYM, EOI
+};
+
+static const char *g_src = 0;
+static int g_pos = 0;
+static int g_ch = 0;
+static int g_sym = 0;
+static int g_int_val = 0;
+static char g_id_name[32] = {0};
+
+static int g_error = 0;
+static const char *g_error_msg = 0;
 
 static void syntax_error(const char *msg) {
     g_error = 1;
@@ -119,17 +160,77 @@ again:
             next_ch();
             g_sym = MINUS;
             return;
+        case '=':
+            next_ch();
+            if (g_ch == '=') {
+                next_ch();
+                g_sym = EQ;
+            } else {
+                g_sym = EQUAL;
+            }
+            return;
+        case '!':
+            next_ch();
+            if (g_ch == '=') {
+                next_ch();
+                g_sym = NE;
+            } else {
+                syntax_error("expected '=' after '!'");
+            }
+            return;
+        case '>':
+            next_ch();
+            if (g_ch == '=') {
+                next_ch();
+                g_sym = GE;
+            } else {
+                g_sym = GREATER;
+            }
+            return;
         case '<':
             next_ch();
-            g_sym = LESS;
+            if (g_ch == '=') {
+                next_ch();
+                g_sym = LE;
+            } else {
+                g_sym = LESS;
+            }
+            return;
+        case '*':
+            next_ch();
+            g_sym = MUL;
+            return;
+        case '/':
+            next_ch();
+            if (g_ch == '/') {
+                while (g_ch && g_ch != '\n') next_ch();
+                goto again;
+            }
+            if (g_ch == '*') {
+                next_ch();
+                while (g_ch) {
+                    if (g_ch == '*') {
+                        next_ch();
+                        if (g_ch == '/') {
+                            next_ch();
+                            goto again;
+                        }
+                    } else {
+                        next_ch();
+                    }
+                }
+                syntax_error("unclosed comment");
+                return;
+            }
+            g_sym = DIV;
+            return;
+        case '%':
+            next_ch();
+            g_sym = MOD;
             return;
         case ';':
             next_ch();
             g_sym = SEMI;
-            return;
-        case '=':
-            next_ch();
-            g_sym = EQUAL;
             return;
         default:
             break;
@@ -176,6 +277,14 @@ again:
             g_sym = WHILE_SYM;
             return;
         }
+        if (streq(g_id_name, "for")) {
+            g_sym = FOR_SYM;
+            return;
+        }
+        if (streq(g_id_name, "print")) {
+            g_sym = PRINT_SYM;
+            return;
+        }
 
         // Variables are single letters a..z.
         if (i == 1 && g_id_name[0] >= 'a' && g_id_name[0] <= 'z') {
@@ -202,6 +311,16 @@ enum {
     IF2,
     WHILE,
     DO,
+    FOR,
+    PRINT,
+    MUL_NODE,
+    DIV_NODE,
+    MOD_NODE,
+    GT_NODE,
+    GE_NODE,
+    LE_NODE,
+    EQ_NODE,
+    NE_NODE,
     EMPTY,
     SEQ,
     EXPR,
@@ -216,8 +335,8 @@ typedef struct node {
     int val;
 } node;
 
-static node g_pool[MAX_NODES];
-static int g_pool_used;
+static node g_pool[MAX_NODES] = {{0}};
+static int g_pool_used = 0;
 
 static node *new_node(int k) {
     if (g_error) return NULL;
@@ -253,10 +372,27 @@ static node *term(void) {
     }
     return paren_expr();
 }
+    
+static node *factor(void) {
+    if (g_error) return NULL;
+    node *x = term();
+    while (!g_error && (g_sym == MUL || g_sym == DIV || g_sym == MOD)) {
+        int k = (g_sym == MUL) ? MUL_NODE : (g_sym == DIV) ? DIV_NODE : MOD_NODE;
+        next_sym();
+        node *t = x;
+        node *r = term();
+        node *n = new_node(k);
+        if (!n) return NULL;
+        n->o1 = t;
+        n->o2 = r;
+        x = n;
+    }
+    return x;
+}
 
 static node *sum(void) {
     if (g_error) return NULL;
-    node *x = term();
+    node *x = factor();
     while (!g_error && (g_sym == PLUS || g_sym == MINUS)) {
         int k = (g_sym == PLUS) ? ADD : SUB;
         next_sym();
@@ -274,11 +410,12 @@ static node *sum(void) {
 static node *test(void) {
     if (g_error) return NULL;
     node *x = sum();
-    if (!g_error && g_sym == LESS) {
+    if (!g_error && (g_sym == LESS || g_sym == GREATER || g_sym == LE || g_sym == GE || g_sym == EQ || g_sym == NE)) {
+        int k = (g_sym == LESS) ? LT : (g_sym == GREATER) ? GT_NODE : (g_sym == LE) ? LE_NODE : (g_sym == GE) ? GE_NODE : (g_sym == EQ) ? EQ_NODE : NE_NODE;
         next_sym();
         node *t = x;
         node *r = sum();
-        node *n = new_node(LT);
+        node *n = new_node(k);
         if (!n) return NULL;
         n->o1 = t;
         n->o2 = r;
@@ -375,6 +512,44 @@ static node *statement(void) {
         return statement_block();
     }
 
+    if (g_sym == FOR_SYM) {
+        node *x = new_node(FOR);
+        if (!x) return NULL;
+        next_sym();
+        if (g_sym != LPAR) { syntax_error("expected '(' after for"); return NULL; }
+        next_sym();
+        if (g_sym != SEMI) x->o1 = expr();
+        if (g_sym != SEMI) { syntax_error("expected ';' in for"); return NULL; }
+        next_sym();
+        if (g_sym != SEMI) x->o2 = expr();
+        if (g_sym != SEMI) { syntax_error("expected ';' in for"); return NULL; }
+        next_sym();
+        if (g_sym != RPAR) x->o3 = expr();
+        if (g_sym != RPAR) { syntax_error("expected ')' in for"); return NULL; }
+        next_sym();
+        node *stmt = statement();
+        // Pack loop body and step into a sequence if needed, but easier to use another node.
+        // Let's use x->val or o4? node only has o1, o2, o3.
+        // Strategy for FOR: o1 = init, o2 = cond, o3 = step, o4 = body.
+        // But node only has 3 pointers. Let's use a nested structure.
+        node *body_node = new_node(SEQ);
+        if (!body_node) return NULL;
+        body_node->o1 = stmt;
+        body_node->o2 = x->o3; // step
+        x->o3 = body_node;
+        return x;
+    }
+
+    if (g_sym == PRINT_SYM) {
+        node *x = new_node(PRINT);
+        if (!x) return NULL;
+        next_sym();
+        x->o1 = expr();
+        if (g_sym != SEMI) { syntax_error("expected ';' after print"); return NULL; }
+        next_sym();
+        return x;
+    }
+
     // <expr> ';'
     {
         node *x = new_node(EXPR);
@@ -382,6 +557,7 @@ static node *statement(void) {
         x->o1 = expr();
         if (g_error) return NULL;
         if (g_sym != SEMI) {
+            // Check if it's just a semicolon (empty statement) which was handled above.
             syntax_error("expected ';' after expression");
             return NULL;
         }
@@ -424,9 +600,20 @@ static node *program(void) {
     if (g_error) return NULL;
     node *x = new_node(PROG);
     if (!x) return NULL;
+    
     next_sym();
-    x->o1 = statement();
-    if (!g_error && g_sym != EOI) syntax_error("unexpected trailing tokens");
+    node *root = new_node(EMPTY);
+    if (!root) return NULL;
+    
+    while (!g_error && g_sym != EOI) {
+        node *stmt = statement();
+        node *n = new_node(SEQ);
+        if (!n) return NULL;
+        n->o1 = root;
+        n->o2 = stmt;
+        root = n;
+    }
+    x->o1 = root;
     return x;
 }
 
@@ -438,17 +625,26 @@ enum {
     IPOP,
     IADD,
     ISUB,
+    IMUL,
+    IDIV,
+    IMOD,
     ILT,
+    IGT,
+    IGE,
+    ILE,
+    IEQ,
+    INE,
     JZ,
     JNZ,
     JMP,
+    IPRINT,
     HALT
 };
 
 typedef signed char code;
 
-static code g_object[MAX_CODE];
-static code *g_here;
+static code g_object[MAX_CODE] = {0};
+static code *g_here = 0;
 
 static void emit(code c) {
     if (g_error) return;
@@ -465,8 +661,8 @@ static code *hole(void) {
 
 static void fix(code *src, code *dst) {
     if (g_error) return;
-    // src is the offset byte itself; offset is relative to src.
-    int diff = (int)(dst - src);
+    // src is the offset byte address. Jump is relative to the address AFTER the offset.
+    int diff = (int)(dst - (src + 1));
     if (diff < -128 || diff > 127) syntax_error("jump offset overflow");
     else *src = (code)diff;
 }
@@ -482,7 +678,10 @@ static void gen(node *x) {
             return;
         case CST:
             emit(IPUSH);
-            emit((code)x->val);
+            emit((code)(x->val & 0xFF));
+            emit((code)((x->val >> 8) & 0xFF));
+            emit((code)((x->val >> 16) & 0xFF));
+            emit((code)((x->val >> 24) & 0xFF));
             return;
         case ADD:
             gen(x->o1);
@@ -494,10 +693,50 @@ static void gen(node *x) {
             gen(x->o2);
             emit(ISUB);
             return;
+        case MUL_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(IMUL);
+            return;
+        case DIV_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(IDIV);
+            return;
+        case MOD_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(IMOD);
+            return;
         case LT:
             gen(x->o1);
             gen(x->o2);
             emit(ILT);
+            return;
+        case GT_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(IGT);
+            return;
+        case GE_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(IGE);
+            return;
+        case LE_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(ILE);
+            return;
+        case EQ_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(IEQ);
+            return;
+        case NE_NODE:
+            gen(x->o1);
+            gen(x->o2);
+            emit(INE);
             return;
         case SET:
             gen(x->o2);
@@ -539,6 +778,31 @@ static void gen(node *x) {
             emit(JNZ);
             fix(hole(), p1);
             return;
+        case FOR:
+            if (x->o1) {
+                gen(x->o1);
+                emit(IPOP);
+            }
+            p1 = g_here;
+            p2 = NULL;
+            if (x->o2) {
+                gen(x->o2);
+                emit(JZ);
+                p2 = hole();
+            }
+            gen(x->o3->o1); // body
+            if (x->o3->o2) {
+                gen(x->o3->o2);
+                emit(IPOP);
+            }
+            emit(JMP);
+            fix(hole(), p1);
+            if (p2) fix(p2, g_here);
+            return;
+        case PRINT:
+            gen(x->o1);
+            emit(IPRINT);
+            return;
         case EMPTY:
             return;
         case SEQ:
@@ -556,211 +820,199 @@ static void gen(node *x) {
     }
 }
 
-// ----- VM -----
-static int g_globals[26];
-static int g_vm_stack[MAX_STACK];
-
-static void print_int(mljos_api_t *api, int v) {
-    if (!api) return;
-    if (v == 0) {
-        api->putchar('0');
-        return;
-    }
-
-    if (v < 0) {
-        api->putchar('-');
-        v = -v;
-    }
-
-    char buf[16];
-    int n = 0;
-    while (v > 0 && n < (int)sizeof(buf)) {
-        buf[n++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    while (n-- > 0) api->putchar(buf[n]);
-}
-
-static void run_vm(mljos_api_t *api) {
-    int *sp = g_vm_stack;
-    code *pc = g_object;
-
-    for (int i = 0; i < 26; i++) g_globals[i] = 0;
-
-    again:
-    switch (*pc++) {
-        case IFETCH:
-            *sp++ = g_globals[*pc++];
-            goto again;
-        case ISTORE:
-            g_globals[*pc++] = sp[-1];
-            goto again;
-        case IPUSH:
-            *sp++ = (int)(*pc++);
-            goto again;
-        case IPOP:
-            --sp;
-            goto again;
-        case IADD:
-            sp[-2] = sp[-2] + sp[-1];
-            --sp;
-            goto again;
-        case ISUB:
-            sp[-2] = sp[-2] - sp[-1];
-            --sp;
-            goto again;
-        case ILT:
-            sp[-2] = sp[-2] < sp[-1];
-            --sp;
-            goto again;
-        case JMP:
-            pc += *pc;
-            goto again;
-        case JZ:
-            if (*--sp == 0) pc += *pc;
-            else pc++;
-            goto again;
-        case JNZ:
-            if (*--sp != 0) pc += *pc;
-            else pc++;
-            goto again;
-        case HALT:
-            break;
-        default:
-            break;
-    }
-
-    for (int i = 0; i < 26; i++) {
-        if (g_globals[i] != 0) {
-            api->putchar((char)('a' + i));
-            api->puts(" = ");
-            print_int(api, g_globals[i]);
-            api->putchar('\n');
-        }
-    }
-}
-
-static int compile_and_run(mljos_api_t *api, const char *program_text) {
-    if (g_error) return 0;
-
+static int compile_and_run(mljos_api_t *api, const char *program_text, const char *output_path) {
     g_error = 0;
-    g_error_msg = NULL;
     lexer_init(program_text);
-
+    node *root = program();
     if (g_error) {
-        api->puts("Tiny-C error: ");
+        api->puts("Tiny-C compilation error: ");
         api->puts(g_error_msg);
         api->putchar('\n');
         return 0;
     }
 
-    // Build AST.
-    g_pool_used = 0;
-    node *root = program();
-    if (g_error || !root) {
-        api->puts("Tiny-C error: ");
-        api->puts(g_error_msg ? g_error_msg : "syntax error");
-        api->putchar('\n');
-        return 0;
-    }
-
-    // Generate bytecode.
     g_here = g_object;
     gen(root);
     if (g_error) {
-        api->puts("Tiny-C error: ");
-        api->puts(g_error_msg ? g_error_msg : "codegen error");
+        api->puts("Tiny-C code generation error: ");
+        api->puts(g_error_msg);
         api->putchar('\n');
         return 0;
     }
 
-    // Execute.
-    run_vm(api);
-    return 1;
-}
+    int code_len = (int)(g_here - g_object);
 
-static int append_line(char *dst, int dst_size, const char *line) {
-    if (!dst || dst_size <= 0) return 0;
-    int pos = 0;
-    // Find current end (avoid relying on strlen from libc).
-    while (pos < dst_size && dst[pos] != '\0') pos++;
-    if (pos >= dst_size) return 0;
+    if (output_path) {
+        api->puts("Compiling to ");
+        api->puts(output_path);
+        api->puts("...\n");
 
-    int ok = 1;
-    for (int i = 0; line && line[i]; i++) {
-        if (pos + 1 >= dst_size) {
-            ok = 0;
-            break;
-        }
-        dst[pos++] = line[i];
-    }
-    dst[pos] = '\0';
-    return ok;
-}
-
-static int read_program(mljos_api_t *api, char *out, int out_size) {
-    if (!api || !out || out_size <= 1) return 0;
-    out[0] = '\0';
-
-    char line[MAX_LINE_LEN];
-    int first = 1;
-
-    while (1) {
-        api->puts(">> ");
-        int len = api->read_line(line, sizeof(line));
-        if (len <= 0) continue;
-
-        // Exit command.
-        if (len == 4 && line[0] == 'q' && line[1] == 'u' && line[2] == 'i' && line[3] == 't') {
-            return -1;
-        }
-
-        // End marker.
-        if (len == 1 && line[0] == '.') {
-            return first ? 0 : 1;
-        }
-
-        if (!first && !append_line(out, out_size, "\n")) {
-            api->puts("Program too long.\n");
+        // Compile to .app
+        static char runner_buf[32768];
+        unsigned int runner_size = 0;
+        
+        if (!api->read_file("/apps/mcrunner.app", runner_buf, sizeof(runner_buf), &runner_size)) {
+            api->puts("Tiny-C error: could not read /apps/mcrunner.app stub\n");
             return 0;
         }
-        first = 0;
 
-        // Append the line content.
-        if (!append_line(out, out_size, line)) {
-            api->puts("Program too long.\n");
-            return 0;
+        // We build the output in a buffer
+        static char out_buf[16000];
+        unsigned int out_pos = 0;
+        
+        for (unsigned int i = 0; i < runner_size; i++) out_buf[out_pos++] = runner_buf[i];
+        
+        // Marker "MCBYTE"
+        out_buf[out_pos++] = 'M';
+        out_buf[out_pos++] = 'C';
+        out_buf[out_pos++] = 'B';
+        out_buf[out_pos++] = 'Y';
+        out_buf[out_pos++] = 'T';
+        out_buf[out_pos++] = 'E';
+        
+        // Bytecode
+        for (int i = 0; i < code_len; i++) out_buf[out_pos++] = (char)g_object[i];
+        
+        if (api->write_file(output_path, out_buf, out_pos)) {
+            api->puts("Successfully compiled to ");
+            api->puts(output_path);
+            api->putchar('\n');
+        } else {
+            api->puts("Tiny-C error: could not write output file\n");
         }
+        return 1;
     }
-}
 
-void _start(mljos_api_t *api) {
-    api->clear_screen();
-    api->puts("Tiny-C microcoder for mljOS\n");
-    api->puts("[microcoder] boot ok\n");
-    api->puts("Enter Tiny-C code, finish with a line containing only '.'\n");
-    api->puts("Type 'quit' to exit.\n\n");
+    // VM state (Interpreter mode)
+    int stack[MAX_STACK];
+    int sp = 0;
+    int vars[26];
+    for (int i = 0; i < 26; i++) vars[i] = 0;
 
-    // Self-test to confirm the app is really running.
-    api->puts("[microcoder] selftest: compile/execute `a=1;`\n");
-    compile_and_run(api, "a=1;");
-    api->puts("\n");
-
+    code *pc = g_object;
     while (1) {
-        api->puts("Program:\n");
-        char program_text[MAX_PROGRAM_LEN];
-        int r = read_program(api, program_text, sizeof(program_text));
-        if (r == -1) break;
-        if (r == 0) {
-            api->puts("Empty program.\n");
-            continue;
+        code instr = *pc++;
+        switch (instr) {
+            case IFETCH: {
+                int reg = (int)(*pc++);
+                stack[sp++] = vars[reg];
+                break;
+            }
+            case ISTORE: {
+                int reg = (int)(*pc++);
+                vars[reg] = stack[--sp];
+                break;
+            }
+            case IPUSH: {
+                int v = (unsigned char)(pc[0]) | ((unsigned char)(pc[1]) << 8) | ((unsigned char)(pc[2]) << 16) | ((unsigned char)(pc[3]) << 24);
+                pc += 4;
+                stack[sp++] = v;
+                break;
+            }
+            case IPOP:
+                sp--;
+                break;
+            case IADD: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = a + b;
+                break;
+            }
+            case ISUB: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = a - b;
+                break;
+            }
+            case IMUL: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = a * b;
+                break;
+            }
+            case IDIV: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (b != 0) ? a / b : 0;
+                break;
+            }
+            case IMOD: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (b != 0) ? a % b : 0;
+                break;
+            }
+            case ILT: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a < b);
+                break;
+            }
+            case IGT: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a > b);
+                break;
+            }
+            case IGE: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a >= b);
+                break;
+            }
+            case ILE: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a <= b);
+                break;
+            }
+            case IEQ: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a == b);
+                break;
+            }
+            case INE: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a != b);
+                break;
+            }
+            case JZ: {
+                int off = (int)(*pc++);
+                if (stack[--sp] == 0) pc += off;
+                break;
+            }
+            case JNZ: {
+                int off = (int)(*pc++);
+                if (stack[--sp] != 0) pc += off;
+                break;
+            }
+            case JMP: {
+                int off = (int)(*pc++);
+                pc += off;
+                break;
+            }
+            case IPRINT: {
+                int v = stack[--sp];
+                if (v < 0) { api->putchar('-'); v = -v; }
+                if (v == 0) { api->putchar('0'); }
+                else {
+                    char buf[12];
+                    int i = 0;
+                    while (v > 0) { buf[i++] = (char)((v % 10) + '0'); v /= 10; }
+                    while (i > 0) api->putchar(buf[--i]);
+                }
+                api->putchar('\n');
+                break;
+            }
+            case HALT:
+                return 1;
+            default:
+                api->puts("Tiny-C runtime error: unknown instruction\n");
+                return 0;
         }
-
-        compile_and_run(api, program_text);
-        api->puts("\n");
     }
-
-    api->clear_screen();
-    api->set_cursor(0, 0);
-    api->puts("Leaving Tiny-C microcoder.\n");
 }
+
+

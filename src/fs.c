@@ -7,6 +7,17 @@
 #include "apps/calc_app.h"
 #include "apps/edit_app.h"
 #include "apps/microcoder_app.h"
+#include "apps/mcrunner_app.h"
+#include "apps/ls_app.h"
+#include "apps/cat_app.h"
+#include "apps/echo_app.h"
+#include "apps/pwd_app.h"
+#include "apps/mkdir_app.h"
+#include "apps/rm_app.h"
+#include "apps/touch_app.h"
+#include "apps/clear_app.h"
+#include "apps/time_app.h"
+#include "apps/date_app.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -110,6 +121,10 @@ static void build_node_path(fs_node_t *node, char *out, int out_size) {
         if (i > 0 && pos < out_size - 1) out[pos++] = '/';
     }
     out[pos] = '\0';
+}
+
+void fs_get_cwd_path(char *out, int out_size) {
+    build_node_path(current_dir, out, out_size);
 }
 
 static int path_starts_with(const char *path, const char *prefix) {
@@ -411,7 +426,6 @@ void fs_init(void) {
     fs_node_t *apps_dir;
     fs_node_t *calc;
     fs_node_t *edit;
-    fs_node_t *microcoder;
 
     fs_node_count = 0;
     fs_data_offset = 0;
@@ -444,11 +458,47 @@ void fs_init(void) {
         edit->content = (char*)edit_app_data;
     }
 
-    microcoder = fs_create_node(apps_dir ? apps_dir : fs_root, "microcoder.app", FS_FILE, 0, 0, 0755);
+    fs_node_t *microcoder = fs_create_node(apps_dir ? apps_dir : fs_root, "microcoder.app", FS_FILE, 0, 0, 0755);
     if (microcoder) {
         microcoder->size = microcoder_app_size;
         microcoder->content = (char*)microcoder_app_data;
     }
+
+    fs_node_t *mcrunner = fs_create_node(apps_dir ? apps_dir : fs_root, "mcrunner.app", FS_FILE, 0, 0, 0755);
+    if (mcrunner) {
+        mcrunner->size = mcrunner_app_size;
+        mcrunner->content = (char*)mcrunner_app_data;
+    }
+
+    fs_node_t *ls = fs_create_node(apps_dir ? apps_dir : fs_root, "ls.app", FS_FILE, 0, 0, 0755);
+    if (ls) { ls->size = ls_app_size; ls->content = (char*)ls_app_data; }
+
+    fs_node_t *cat = fs_create_node(apps_dir ? apps_dir : fs_root, "cat.app", FS_FILE, 0, 0, 0755);
+    if (cat) { cat->size = cat_app_size; cat->content = (char*)cat_app_data; }
+
+    fs_node_t *echo = fs_create_node(apps_dir ? apps_dir : fs_root, "echo.app", FS_FILE, 0, 0, 0755);
+    if (echo) { echo->size = echo_app_size; echo->content = (char*)echo_app_data; }
+
+    fs_node_t *pwd = fs_create_node(apps_dir ? apps_dir : fs_root, "pwd.app", FS_FILE, 0, 0, 0755);
+    if (pwd) { pwd->size = pwd_app_size; pwd->content = (char*)pwd_app_data; }
+
+    fs_node_t *mkdir_node = fs_create_node(apps_dir ? apps_dir : fs_root, "mkdir.app", FS_FILE, 0, 0, 0755);
+    if (mkdir_node) { mkdir_node->size = mkdir_app_size; mkdir_node->content = (char*)mkdir_app_data; }
+
+    fs_node_t *rm_node = fs_create_node(apps_dir ? apps_dir : fs_root, "rm.app", FS_FILE, 0, 0, 0755);
+    if (rm_node) { rm_node->size = rm_app_size; rm_node->content = (char*)rm_app_data; }
+
+    fs_node_t *touch = fs_create_node(apps_dir ? apps_dir : fs_root, "touch.app", FS_FILE, 0, 0, 0755);
+    if (touch) { touch->size = touch_app_size; touch->content = (char*)touch_app_data; }
+
+    fs_node_t *clear = fs_create_node(apps_dir ? apps_dir : fs_root, "clear.app", FS_FILE, 0, 0, 0755);
+    if (clear) { clear->size = clear_app_size; clear->content = (char*)clear_app_data; }
+
+    fs_node_t *time = fs_create_node(apps_dir ? apps_dir : fs_root, "time.app", FS_FILE, 0, 0, 0755);
+    if (time) { time->size = time_app_size; time->content = (char*)time_app_data; }
+
+    fs_node_t *date = fs_create_node(apps_dir ? apps_dir : fs_root, "date.app", FS_FILE, 0, 0, 0755);
+    if (date) { date->size = date_app_size; date->content = (char*)date_app_data; }
 }
 
 void fs_ensure_dir(const char *path, uint16_t uid, uint16_t gid, uint16_t mode) {
@@ -916,10 +966,10 @@ int fs_list_dir_file_names(const char *path, char *out, int out_size) {
 
     child = dir->child;
     while (child && pos < out_size - 1) {
-        if (child->flags == FS_FILE) {
-            if (!first && pos < out_size - 1) out[pos++] = '\n';
-            first = 0;
+        if (child->flags == FS_FILE || child->flags == FS_DIR) {
+            // Use null terminator as separator for standalone apps
             for (int i = 0; child->name[i] && pos < out_size - 1; i++) out[pos++] = child->name[i];
+            if (pos < out_size - 1) out[pos++] = '\0';
         }
         child = child->sibling;
     }

@@ -31,11 +31,15 @@ int usb_get_controller(int index, usb_controller_info_t *out);
 int usb_storage_device_count(void);
 int usb_storage_get_device(int index, usb_storage_device_info_t *out);
 int usb_storage_read_sector(int index, uint32_t lba, uint8_t *buffer);
+int usb_storage_write_sector(int index, uint32_t lba, const uint8_t *buffer);
+int usb_storage_test_ready(int index);
 void cmd_usb_list(void);
 void cmd_usb_ports(int controller_index);
 void cmd_usb_reset(int controller_index, int port_index);
 void cmd_usb_probe(int controller_index, int port_index);
 void cmd_usb_storage(int controller_index, int port_index);
 void cmd_usb_read(int controller_index, int port_index, uint32_t lba);
+void usb_delay(void);
+
 
 #endif

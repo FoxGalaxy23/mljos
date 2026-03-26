@@ -109,14 +109,18 @@ static ata_device_t g_ata_devices[ATA_MAX_DEVICES] = {
 static disk_device_t g_disk_devices[DISK_MAX_DEVICES] = {0};
 static int g_disk_active_index = 0;
 static int g_disk_devices_probed = 0;
+static int g_disk_ever_probed = 0;
 static int g_disk_device_count = 0;
 static int g_disk_io_error = 0;
+static int g_disk_system_index = -1;
 
 static int fat32_build_short_name(const char *name, uint8_t out[11]);
 static void disk_probe_devices(void);
 static fat32_volume_t *disk_current_volume(void);
 static disk_device_t *disk_current_device(void);
 static ata_device_t *disk_current_ata_device(void);
+static int ata_read_sector(uint32_t lba, uint8_t *buffer);
+static int ata_write_sector(uint32_t lba, const uint8_t *buffer);
 
 #define g_fat32 (*disk_current_volume())
 
@@ -456,26 +460,38 @@ static uint32_t ata_identify_total_sectors(ata_device_t *device) {
 static void disk_probe_devices(void) {
     if (g_disk_devices_probed) return;
 
+    int first_run = !g_disk_ever_probed;
     g_disk_device_count = 0;
     kmemset(g_disk_devices, 0, sizeof(g_disk_devices));
     for (int i = 0; i < ATA_MAX_DEVICES; i++) {
+        uint8_t identify[512];
+        uint16_t io_base = g_ata_devices[i].io_base;
+        
+        // Low-level check for ATAPI (CD-ROM)
+        int is_atapi = 0;
+        outb(io_base + 6, g_ata_devices[i].identify_select);
+        usb_delay(); // reuse usb_delay for a tiny wait
+        if (inb(io_base + 4) == 0x14 && inb(io_base + 5) == 0xEB) is_atapi = 1;
+
         g_ata_devices[i].total_sectors = ata_identify_total_sectors(&g_ata_devices[i]);
         g_ata_devices[i].present = g_ata_devices[i].total_sectors > 0;
+        
         if (g_ata_devices[i].present && g_disk_device_count < DISK_MAX_DEVICES) {
             disk_device_t *device = &g_disk_devices[g_disk_device_count];
 
             device->type = DISK_BACKEND_ATA;
             device->backend_index = i;
             device->total_sectors = g_ata_devices[i].total_sectors;
-            device->writable = 1;
+            device->writable = is_atapi ? 0 : 1;
             strcpy(device->label, g_ata_devices[i].name);
-            if (!g_fat32_volumes[g_disk_device_count].current_path[0]) {
+            if (first_run && !g_fat32_volumes[g_disk_device_count].current_path[0]) {
                 g_disk_active_index = g_disk_device_count;
                 fat32_reset_cwd();
             }
             g_disk_device_count++;
         }
     }
+
 
     for (int i = 0; i < usb_storage_device_count() && g_disk_device_count < DISK_MAX_DEVICES; i++) {
         usb_storage_device_info_t usb_info;
@@ -488,9 +504,9 @@ static void disk_probe_devices(void) {
         device->type = DISK_BACKEND_USB;
         device->backend_index = i;
         device->total_sectors = usb_info.sector_count;
-        device->writable = 0;
+        device->writable = 1;
         strcpy(device->label, "usb");
-        if (!g_fat32_volumes[g_disk_device_count].current_path[0]) {
+        if (first_run && !g_fat32_volumes[g_disk_device_count].current_path[0]) {
             g_disk_active_index = g_disk_device_count;
             fat32_reset_cwd();
         }
@@ -498,12 +514,25 @@ static void disk_probe_devices(void) {
     }
 
     g_disk_devices_probed = 1;
-    (void)disk_pick_default_device();
+    g_disk_ever_probed = 1;
+    if (first_run) (void)disk_pick_default_device();
+}
+
+void disk_probe_devices_reset(void) {
+    g_disk_devices_probed = 0;
+}
+
+int disk_get_system_device(void) {
+    return g_disk_system_index;
+}
+
+void disk_set_system_device(int index) {
+    if (index >= 0 && index < DISK_MAX_DEVICES) g_disk_system_index = index;
 }
 
 static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
     uint8_t zero[512];
-    ata_device_t *device = disk_current_ata_device();
+    disk_device_t *device = disk_current_device();
 
     if (!device) {
         g_disk_io_error = 1;
@@ -511,10 +540,28 @@ static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
     }
 
     kmemset(zero, 0, sizeof(zero));
-    for (uint32_t i = 0; i < count; i++) {
-        if (!ata_device_write_sector(device, lba + i, zero)) {
-            g_disk_io_error = 1;
-            return;
+    
+    if (device->type == DISK_BACKEND_USB) {
+        // Optimized multi-sector zeroing for USB
+        // We reuse the same zero sector multiple times in the TD chain
+        // but since our writer wants a continuous buffer, we do it in smaller steps
+        // to keep memory usage low. 1 sector at a time is slow but reliable if BOT is fast.
+        // Wait, I updated usb_mass_write10 to handle any length!
+        // But it still needs the data in a buffer.
+        
+        for (uint32_t i = 0; i < count; i++) {
+            if (!usb_storage_write_sector(device->backend_index, lba + i, zero)) {
+                g_disk_io_error = 1;
+                return;
+            }
+            if (i % 128 == 0) usb_delay(); // Periodic breather for slow sticks
+        }
+    } else {
+        for (uint32_t i = 0; i < count; i++) {
+            if (!ata_write_sector(lba + i, zero)) {
+                g_disk_io_error = 1;
+                return;
+            }
         }
     }
 }
@@ -529,9 +576,11 @@ static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
 }
 
 static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
-    ata_device_t *device = disk_current_ata_device();
+    disk_device_t *device = disk_current_device();
     if (!device) return 0;
-    return ata_device_write_sector(device, lba, buffer);
+    if (device->type == DISK_BACKEND_ATA) return ata_device_write_sector(disk_current_ata_device(), lba, buffer);
+    if (device->type == DISK_BACKEND_USB) return usb_storage_write_sector(device->backend_index, lba, buffer);
+    return 0;
 }
 
 static uint32_t fat32_cluster_to_lba(uint32_t cluster) {
@@ -1389,13 +1438,13 @@ void cmd_disk_format(void) {
     g_disk_io_error = 0;
 
     if (!disk_require_active_device("disk format")) return;
-    if (!device || !device->writable || device->type != DISK_BACKEND_ATA) {
-        puts("disk format: available only for writable ATA disks\n");
+    if (!device || !device->writable) {
+        puts("disk format: available only for writable disks\n");
         return;
     }
 
     if (total_sectors == 0) {
-        puts("disk format: unable to identify ATA disk\n");
+        puts("disk format: unable to identify disk\n");
         return;
     }
 
@@ -1430,13 +1479,32 @@ void cmd_disk_format(void) {
         return;
     }
 
+    if (device->type == DISK_BACKEND_USB) {
+        puts("Waiting for USB device to be ready...\n");
+        for (int retry = 0; retry < 10; retry++) {
+            if (usb_storage_test_ready(device->backend_index)) break;
+            usb_delay();
+            if (retry == 9) {
+                puts("disk format: USB device not ready (timeout)\n");
+                return;
+            }
+        }
+    }
+
+    puts("Formatting disk");
+    putchar('0' + g_disk_active_index);
+    puts(" (");
+    puts(device->label);
+    puts(")...\n");
+
     ata_write_zero_sectors(0, 1);
     ata_write_zero_sectors(partition_lba, reserved_sector_count);
     ata_write_zero_sectors(partition_lba + reserved_sector_count, num_fats * fat_size);
     if (g_disk_io_error) {
-        puts("disk format: ATA write failed while clearing metadata area\n");
+        puts("disk format: disk write failed while clearing metadata area (I/O error)\n");
         return;
     }
+
 
     kmemset(mbr, 0, sizeof(mbr));
     mbr[446 + 4] = 0x0C;
@@ -1507,9 +1575,10 @@ void cmd_disk_format(void) {
     ata_write_zero_sectors(partition_lba + reserved_sector_count + fat_size + 1, fat_size - 1);
     ata_write_zero_sectors(partition_lba + reserved_sector_count + (num_fats * fat_size), sectors_per_cluster);
     if (g_disk_io_error) {
-        puts("disk format: ATA write failed while zeroing FAT/data region\n");
+        puts("disk format: disk write failed while zeroing FAT/data region (I/O error)\n");
         return;
     }
+
 
     g_fat32.mounted = 0;
     fat32_reset_cwd();
@@ -1572,7 +1641,7 @@ void cmd_disk_ls(const char *path) {
         uint32_t cluster_lba = fat32_cluster_to_lba(cluster);
         for (uint8_t sec = 0; sec < g_fat32.sectors_per_cluster; sec++) {
             if (!ata_read_sector(cluster_lba + sec, sector)) {
-                puts("disk ls: ATA read error\n");
+                puts("disk ls: disk read error\n");
                 return;
             }
             for (int offset = 0; offset < 512; offset += 32) {
@@ -1716,11 +1785,10 @@ int disk_list_dir_file_names(const char *path, char *out, int out_size) {
                     continue;
                 }
 
-                if (item.entry.attr & FAT32_ATTR_DIRECTORY) continue;
                 if (!item.display_name[0]) continue;
 
-                if (pos > 0 && pos < out_size - 1) out[pos++] = '\n';
                 for (int i = 0; item.display_name[i] && pos < out_size - 1; i++) out[pos++] = item.display_name[i];
+                if (pos < out_size - 1) out[pos++] = '\0';
                 if (pos >= out_size - 1) {
                     out[pos] = '\0';
                     return 1;
@@ -2247,7 +2315,7 @@ void cmd_disk_cat(const char *path) {
     while (remaining > 0 && file_cluster >= 2) {
         fat32_read_cluster(file_cluster, cluster_buffer);
         if (g_disk_io_error) {
-            puts("disk cat: ATA read error\n");
+            puts("disk cat: disk read error\n");
             return;
         }
         uint32_t chunk = remaining > cluster_bytes ? cluster_bytes : remaining;
@@ -2298,12 +2366,12 @@ void cmd_disk_rm(const char *path) {
 
     for (int i = 0; i < entry.lfn_count; i++) {
         if (!ata_read_sector(entry.lfn_slots[i].sector_lba, sector)) {
-            puts("disk rm: ATA read error\n");
+            puts("disk rm: disk read error\n");
             return;
         }
         sector[entry.lfn_slots[i].offset] = 0xE5;
         if (!ata_write_sector(entry.lfn_slots[i].sector_lba, sector)) {
-            puts("disk rm: ATA write error\n");
+            puts("disk rm: disk write error\n");
             return;
         }
     }
@@ -2329,7 +2397,7 @@ void cmd_disk_install(void) {
 
     if (!disk_require_active_device("disk install")) return;
     if (!disk_current_is_writable()) {
-        puts("disk install: available only for writable ATA disks\n");
+        puts("disk install: available only for writable disks\n");
         return;
     }
 
@@ -2416,7 +2484,7 @@ void cmd_disk_exec(const char *path) {
     while (remaining > 0 && file_cluster >= 2) {
         fat32_read_cluster(file_cluster, cluster_buffer);
         if (g_disk_io_error) {
-            puts("exec: ATA read error\n");
+            puts("exec: disk read error\n");
             return;
         }
         uint32_t chunk = remaining > cluster_bytes ? cluster_bytes : remaining;

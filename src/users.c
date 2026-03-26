@@ -382,6 +382,7 @@ int users_load_from_disk(void) {
     }
 
     g_system_installed = 1;
+    disk_set_system_device(disk_get_active_device());
     next_uid_from_table();
     for (int i = 0; i < g_user_count; i++) {
         if (g_users[i].uid == 0) {

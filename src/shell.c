@@ -13,6 +13,27 @@ static int app_write_file(const char *path, const char *buf, unsigned int size);
 static void os_set_cursor(int row, int col);
 static void os_putchar_at(char ch, int row, int col);
 static int os_read_key(void);
+static int os_list_dir(const char *path, char *out, int out_size);
+static int os_get_cwd(char *out, int out_size);
+static int os_mkdir(const char *path);
+static int os_rm(const char *path);
+static void os_get_time(uint8_t *h, uint8_t *m, uint8_t *s);
+static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y);
+
+typedef enum storage_target {
+    STORAGE_RAM = 0,
+    STORAGE_DISK = 1
+} storage_target_t;
+
+typedef enum shell_location {
+    SHELL_ROOT = 0,
+    SHELL_STORAGE = 1
+} shell_location_t;
+
+static storage_target_t active_storage = STORAGE_RAM;
+static shell_location_t shell_location = SHELL_STORAGE;
+
+static int shell_disk_primary_mode(void);
 
 // Used to pass an optional file path to apps (e.g., `edit <path>`).
 static char g_edit_open_path[128];
@@ -27,6 +48,12 @@ mljos_api_t os_api = {
     .set_cursor = os_set_cursor,
     .putchar_at = os_putchar_at,
     .read_key = os_read_key,
+    .list_dir = os_list_dir,
+    .get_cwd = os_get_cwd,
+    .mkdir = os_mkdir,
+    .rm = os_rm,
+    .get_time = os_get_time,
+    .get_date = os_get_date,
     .open_path = g_edit_open_path,
 };
 
@@ -109,22 +136,82 @@ static int os_read_key(void) {
     }
 }
 
+static storage_target_t resolve_storage(const char *path, const char **out_path) {
+    if (strncmp(path, "disk:", 5) == 0) {
+        if (out_path) *out_path = path + 5;
+        return STORAGE_DISK;
+    }
+    if (strncmp(path, "ram:", 4) == 0) {
+        if (out_path) *out_path = path + 4;
+        return STORAGE_RAM;
+    }
+    if (out_path) *out_path = path;
+    return active_storage;
+}
+
+static int os_list_dir(const char *path, char *out, int out_size) {
+    const char *p;
+    storage_target_t target = resolve_storage(path, &p);
+    if (shell_disk_primary_mode() || target == STORAGE_DISK) {
+        return disk_list_dir_file_names(p, out, out_size);
+    }
+    return fs_list_dir_file_names(p, out, out_size);
+}
+
+static int os_get_cwd(char *out, int out_size) {
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
+        const char *cwd = disk_get_cwd_path();
+        if (!cwd || !out || out_size < 1) return 0;
+        int i = 0;
+        while (cwd[i] && i < out_size - 1) {
+            out[i] = cwd[i];
+            i++;
+        }
+        out[i] = '\0';
+        return 1;
+    }
+    
+    if (out && out_size > 1) {
+        fs_get_cwd_path(out, out_size);
+        return 1;
+    }
+    return 0;
+}
+
+static int os_mkdir(const char *path) {
+    const char *p;
+    storage_target_t target = resolve_storage(path, &p);
+    if (shell_disk_primary_mode() || target == STORAGE_DISK) {
+        return disk_ensure_directory(p);
+    }
+    cmd_mkdir_p(p);
+    return 1;
+}
+
+static int os_rm(const char *path) {
+    const char *p;
+    storage_target_t target = resolve_storage(path, &p);
+    if (shell_disk_primary_mode() || target == STORAGE_DISK) {
+        cmd_disk_rm(p);
+        return 1;
+    }
+    cmd_rm(p);
+    return 1;
+}
+
+static void os_get_time(uint8_t *h, uint8_t *m, uint8_t *s) {
+    get_rtc_time(h, m, s);
+}
+
+static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y) {
+    get_rtc_date(d, mo, y);
+}
+
 static char history[HISTORY_SIZE][128];
 static int history_count = 0;
 static int history_pos = -1;
 
-typedef enum storage_target {
-    STORAGE_RAM = 0,
-    STORAGE_DISK = 1
-} storage_target_t;
-
-typedef enum shell_location {
-    SHELL_ROOT = 0,
-    SHELL_STORAGE = 1
-} shell_location_t;
-
-static storage_target_t active_storage = STORAGE_RAM;
-static shell_location_t shell_location = SHELL_STORAGE;
+// Old storage definitions removed
 
 static void handle_command(char *line);
 static int shell_disk_primary_mode(void);
@@ -135,17 +222,21 @@ static int shell_exec_script_file(const char *path, int quiet_errors);
 static void shell_run_autorun_scripts(void);
 
 static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out) {
-    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
-        return disk_read_file(path, buf, maxlen, (uint32_t*)size_out);
+    const char *p;
+    storage_target_t target = resolve_storage(path, &p);
+    if (shell_disk_primary_mode() || target == STORAGE_DISK) {
+        return disk_read_file(p, buf, maxlen, (uint32_t*)size_out);
     }
-    return fs_read_file(path, buf, maxlen, (uint32_t*)size_out);
+    return fs_read_file(p, buf, maxlen, (uint32_t*)size_out);
 }
 
 static int app_write_file(const char *path, const char *buf, unsigned int size) {
-    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
-        return disk_write_file(path, buf, size);
+    const char *p;
+    storage_target_t target = resolve_storage(path, &p);
+    if (shell_disk_primary_mode() || target == STORAGE_DISK) {
+        return disk_write_file(p, buf, size);
     }
-    return fs_write_file(path, buf, (uint32_t)size);
+    return fs_write_file(p, buf, (uint32_t)size);
 }
 
 static int shell_disk_primary_mode(void) {
@@ -186,48 +277,28 @@ static void print_active_path(void) {
 }
 
 static void cmd_time(void) {
-    uint8_t h, m, s;
-    get_rtc_time(&h, &m, &s);
-    putchar('0' + (h / 10));
-    putchar('0' + (h % 10));
-    putchar(':');
-    putchar('0' + (m / 10));
-    putchar('0' + (m % 10));
-    putchar(':');
-    putchar('0' + (s / 10));
-    putchar('0' + (s % 10));
-    putchar('\n');
+    shell_exec_app_command("time");
 }
 
 static void cmd_date(void) {
-    uint8_t d, mo;
-    uint16_t y;
-    char ybuf[5];
-
-    get_rtc_date(&d, &mo, &y);
-    putchar('0' + (d / 10));
-    putchar('0' + (d % 10));
-    putchar('.');
-    putchar('0' + (mo / 10));
-    putchar('0' + (mo % 10));
-    putchar('.');
-
-    ybuf[4] = '\0';
-    ybuf[3] = '0' + (y % 10); y /= 10;
-    ybuf[2] = '0' + (y % 10); y /= 10;
-    ybuf[1] = '0' + (y % 10); y /= 10;
-    ybuf[0] = '0' + (y % 10);
-    puts(ybuf);
-    putchar('\n');
+    shell_exec_app_command("date");
 }
 
 static void cmd_echo(const char *rest) {
-    if (!rest) {
-        putchar('\n');
-        return;
+    char app_path[128];
+    if (fs_resolve_app_command("echo", app_path, sizeof(app_path))) {
+        if (rest) {
+            int i = 0;
+            while (rest[i] && i < 127) {
+                g_edit_open_path[i] = rest[i];
+                i++;
+            }
+            g_edit_open_path[i] = '\0';
+        } else {
+            g_edit_open_path[0] = '\0';
+        }
+        shell_exec_app_command("echo");
     }
-    puts(rest);
-    putchar('\n');
 }
 
 static void cmd_reboot(void) {
@@ -555,31 +626,7 @@ static void print_usb_help(void) {
     puts("USB: usb, usb controllers, usb ports <controller>, usb reset <controller> <port>, usb probe <controller> <port>, usb storage <controller> <port>, usb read <controller> <port> [lba]\n");
 }
 
-static void mkdir_disk_parents(const char *path) {
-    char temp[128];
-    int pos = 0;
-    int start = 0;
-
-    if (!path || !path[0]) {
-        puts("mkdir: missing operand\n");
-        return;
-    }
-
-    if (path[0] == '/') temp[pos++] = '/';
-    while (path[start] == '/') start++;
-
-    for (int i = start;; i++) {
-        char c = path[i];
-        if (c == '/' || c == '\0') {
-            temp[pos] = '\0';
-            if (pos > 0 && strcmp(temp, "/") != 0) cmd_disk_mkdir(temp);
-            if (c == '\0') break;
-            if (pos < (int)sizeof(temp) - 1 && temp[pos - 1] != '/') temp[pos++] = '/';
-            continue;
-        }
-        if (pos < (int)sizeof(temp) - 1) temp[pos++] = c;
-    }
-}
+// Removed mkdir_disk_parents as it is no longer used
 
 static void cmd_mkdir_active(const char *path, int create_parents);
 static void cmd_rmdir_active(const char *path);
@@ -618,9 +665,16 @@ static int shell_try_launch_app_command(const char *name) {
     if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) return 0;
 
     if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
-        if (!disk_can_exec_path(app_path)) return 0;
-        cmd_disk_exec(app_path);
-        return 1;
+        if (disk_can_exec_path(app_path)) {
+            cmd_disk_exec(app_path);
+            return 1;
+        }
+        // Fallback to RAM in live mode if not found on disk
+        if (!shell_disk_primary_mode() && fs_can_exec_path(app_path)) {
+            cmd_ram_exec(app_path);
+            return 1;
+        }
+        return 0;
     }
 
     if (!fs_can_exec_path(app_path)) return 0;
@@ -640,8 +694,31 @@ static void shell_exec_app_command(const char *name) {
         return;
     }
 
-    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) cmd_disk_exec(app_path);
-    else cmd_ram_exec(app_path);
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
+        if (disk_can_exec_path(app_path)) {
+            cmd_disk_exec(app_path);
+        } else if (disk_get_system_device() >= 0 && disk_get_system_device() != disk_get_active_device()) {
+            int current = disk_get_active_device();
+            disk_select_device(disk_get_system_device());
+            if (disk_can_exec_path(app_path)) {
+                cmd_disk_exec(app_path);
+                disk_select_device(current);
+            } else {
+                disk_select_device(current);
+                if (!shell_disk_primary_mode() && fs_can_exec_path(app_path)) {
+                    cmd_ram_exec(app_path);
+                } else {
+                    cmd_disk_exec(app_path); // Let it show the "file not found" error
+                }
+            }
+        } else if (!shell_disk_primary_mode() && fs_can_exec_path(app_path)) {
+            cmd_ram_exec(app_path);
+        } else {
+            cmd_disk_exec(app_path); // Let it show the "file not found" error
+        }
+    } else {
+        cmd_ram_exec(app_path);
+    }
 }
 
 static void enter_logged_user_home(void) {
@@ -705,20 +782,6 @@ static void do_login(void) {
     }
 }
 
-static void cmd_ls_active(const char *path) {
-    if (shell_disk_primary_mode()) {
-        cmd_disk_ls(path);
-        return;
-    }
-    if (shell_location == SHELL_ROOT) {
-        puts("ram\n");
-        puts("disk\n");
-        return;
-    }
-    if (active_storage == STORAGE_DISK) cmd_disk_ls(path);
-    else cmd_ls_path(path);
-}
-
 static void cmd_cd_active(const char *path) {
     if (!path || !path[0]) {
         if (shell_disk_primary_mode()) enter_logged_user_home();
@@ -760,84 +823,7 @@ static void cmd_cd_active(const char *path) {
     else cmd_cd(path);
 }
 
-static void cmd_pwd_active(void) {
-    if (shell_disk_primary_mode()) {
-        cmd_disk_pwd();
-        return;
-    }
-    if (shell_location == SHELL_ROOT) {
-        puts("/\n");
-        return;
-    }
-
-    if (active_storage == STORAGE_DISK) {
-        print_disk_storage_name();
-        putchar(':');
-        cmd_disk_pwd();
-    } else {
-        puts(storage_name(active_storage));
-        putchar(':');
-        cmd_pwd();
-    }
-}
-
-static void cmd_mkdir_active(const char *path, int create_parents) {
-    if (shell_disk_primary_mode()) {
-        if (create_parents) mkdir_disk_parents(path);
-        else cmd_disk_mkdir(path);
-        return;
-    }
-    if (shell_location == SHELL_ROOT) {
-        puts("mkdir: select a storage first with cd ram or cd disk\n");
-        return;
-    }
-    if (active_storage == STORAGE_DISK) {
-        if (create_parents) mkdir_disk_parents(path);
-        else cmd_disk_mkdir(path);
-    } else {
-        if (create_parents) cmd_mkdir_p(path);
-        else cmd_mkdir(path);
-    }
-}
-
-static void cmd_rmdir_active(const char *path) {
-    if (shell_disk_primary_mode()) {
-        cmd_disk_rm(path);
-        return;
-    }
-    if (shell_location == SHELL_ROOT) {
-        puts("rmdir: select a storage first with cd ram or cd disk\n");
-        return;
-    }
-    if (active_storage == STORAGE_DISK) cmd_disk_rm(path);
-    else cmd_rmdir(path);
-}
-
-static void cmd_rm_active(const char *path) {
-    if (shell_disk_primary_mode()) {
-        cmd_disk_rm(path);
-        return;
-    }
-    if (shell_location == SHELL_ROOT) {
-        puts("rm: select a storage first with cd ram or cd disk\n");
-        return;
-    }
-    if (active_storage == STORAGE_DISK) cmd_disk_rm(path);
-    else cmd_rm(path);
-}
-
-static void cmd_cat_active(const char *path) {
-    if (shell_disk_primary_mode()) {
-        cmd_disk_cat(path);
-        return;
-    }
-    if (shell_location == SHELL_ROOT) {
-        puts("cat: select a storage first with cd ram or cd disk\n");
-        return;
-    }
-    if (active_storage == STORAGE_DISK) cmd_disk_cat(path);
-    else cmd_cat(path);
-}
+// Removed redundant cmd_*_active functions as they are now handled by standalone apps
 
 static void cmd_write_active(const char *path, const char *text) {
     if (shell_disk_primary_mode()) {
@@ -1161,7 +1147,7 @@ static void handle_command(char *line) {
     } else if (strcmp(argv[0], "shutdown") == 0) {
         cmd_shutdown();
     } else if (strcmp(argv[0], "clear") == 0) {
-        clear_screen();
+        shell_exec_app_command("clear");
     } else if (strcmp(argv[0], "login") == 0 || strcmp(argv[0], "logout") == 0) {
         do_login();
     } else if (strcmp(argv[0], "whoami") == 0) {
@@ -1200,34 +1186,39 @@ static void handle_command(char *line) {
         if (!users_effective_is_root()) puts("install: requires root\n");
         else run_install_wizard();
     } else if (strcmp(argv[0], "ls") == 0) {
-        if (argc > 1) cmd_ls_active(argv[1]);
-        else cmd_ls_active(NULL);
+        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
+        else g_edit_open_path[0] = '\0';
+        shell_exec_app_command("ls");
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "cd") == 0) {
         cmd_cd_active(argc > 1 ? argv[1] : NULL);
     } else if (strcmp(argv[0], "pwd") == 0) {
-        cmd_pwd_active();
+        shell_exec_app_command("pwd");
     } else if (strcmp(argv[0], "mkdir") == 0) {
-        if (argc > 2 && strcmp(argv[1], "-p") == 0) cmd_mkdir_active(argv[2], 1);
-        else if (argc > 1) cmd_mkdir_active(argv[1], 0);
-        else puts("mkdir: missing operand\n");
+        if (argc > 1) strncpy(g_edit_open_path, argv[argc - 1], sizeof(g_edit_open_path));
+        else g_edit_open_path[0] = '\0';
+        shell_exec_app_command("mkdir");
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "rmdir") == 0) {
-        if (argc > 1) cmd_rmdir_active(argv[1]);
-        else puts("rmdir: missing operand\n");
+        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
+        else g_edit_open_path[0] = '\0';
+        shell_exec_app_command("rm"); // use rm app for rmdir if simple
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "touch") == 0) {
-        if (shell_disk_primary_mode()) {
-            if (argc > 1) {
-                if (!disk_touch_file(argv[1])) puts("touch: unable to create file on disk\n");
-            } else puts("touch: missing operand\n");
-        } else if (shell_location == SHELL_ROOT) puts("touch: select a storage first with cd ram\n");
-        else if (active_storage == STORAGE_DISK) puts("touch: available only for ram storage\n");
-        else if (argc > 1) cmd_touch(argv[1]);
-        else puts("touch: missing operand\n");
+        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
+        else g_edit_open_path[0] = '\0';
+        shell_exec_app_command("touch");
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "rm") == 0) {
-        if (argc > 1) cmd_rm_active(argv[1]);
-        else puts("rm: missing operand\n");
+        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
+        else g_edit_open_path[0] = '\0';
+        shell_exec_app_command("rm");
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "cat") == 0) {
-        if (argc > 1) cmd_cat_active(argv[1]);
-        else puts("cat: missing operand\n");
+        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
+        else g_edit_open_path[0] = '\0';
+        shell_exec_app_command("cat");
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "cp") == 0) {
         if (shell_disk_primary_mode()) {
             if (argc > 2) {
@@ -1242,9 +1233,9 @@ static void handle_command(char *line) {
             join_args(joined, sizeof(joined), argv, 2, argc);
             cmd_write_active(argv[1], joined);
         } else puts("write: missing file or text\n");
-    } else if (strcmp(argv[0], "edit") == 0) {
+    } else if (strcmp(argv[0], "edit") == 0 || strcmp(argv[0], "microcoder") == 0) {
         if (argc > 1) {
-            // Allow `edit "some path.txt"` by re-joining all remaining args.
+            // Allow "some path.txt" by re-joining all remaining args.
             join_args(joined, sizeof(joined), argv, 1, argc);
             strncpy(g_edit_open_path, joined, sizeof(g_edit_open_path));
             g_edit_open_path[sizeof(g_edit_open_path) - 1] = '\0';
@@ -1252,14 +1243,16 @@ static void handle_command(char *line) {
             g_edit_open_path[0] = '\0';
         }
 
-        shell_exec_app_command("edit");
+        shell_exec_app_command(argv[0]);
 
         // Clear after launching app to avoid leaking path into the next run
-        // (especially when opening is triggered without an explicit argument).
         g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "disk") == 0) {
-        if (argc < 2) puts("disk: missing command (devices, use, format, ls, cd, pwd, mkdir, write, cat, rm)\n");
+        if (argc < 2) puts("disk: missing command (devices, use, format, probe, ls, cd, pwd, mkdir, write, cat, rm)\n");
         else if (strcmp(argv[1], "devices") == 0 || strcmp(argv[1], "list") == 0) {
+            cmd_disk_devices();
+        } else if (strcmp(argv[1], "probe") == 0) {
+            disk_probe_devices_reset();
             cmd_disk_devices();
         } else if (strcmp(argv[1], "use") == 0) {
             int disk_index = -1;

@@ -173,7 +173,10 @@ static uhci_qh_t g_uhci_qh __attribute__((aligned(16)));
 static uhci_td_t g_uhci_tds[UHCI_MAX_TDS] __attribute__((aligned(16)));
 static usb_setup_packet_t g_uhci_setup_packet __attribute__((aligned(16)));
 static uint8_t g_uhci_data_buffer[512] __attribute__((aligned(16)));
+static usb_mass_cbw_t g_usb_bot_cbw __attribute__((aligned(16)));
+static usb_mass_csw_t g_usb_bot_csw __attribute__((aligned(16)));
 static int g_uhci_initialized[USB_MAX_CONTROLLERS] = {0};
+
 
 static void print_uint(uint32_t value) {
     char buf[11];
@@ -201,6 +204,11 @@ static void print_hex8(uint8_t value) {
 static void print_hex16(uint16_t value) {
     print_hex8((uint8_t)(value >> 8));
     print_hex8((uint8_t)value);
+}
+
+static void print_hex32(uint32_t value) {
+    print_hex16((uint16_t)(value >> 16));
+    print_hex16((uint16_t)value);
 }
 
 static void *kmemset(void *dst, int value, uint32_t n) {
@@ -329,7 +337,7 @@ static const char *usb_controller_type(uint8_t prog_if) {
     return "USB";
 }
 
-static void usb_delay(void) {
+void usb_delay(void) {
     for (uint32_t i = 0; i < 500000; i++) {
         __asm__ volatile ("nop");
     }
@@ -468,14 +476,15 @@ static int uhci_prepare_port(const usb_controller_info_t *info, int port_index) 
 static int uhci_run_td_chain(const usb_controller_info_t *info, uhci_td_t *first_td, uhci_td_t *last_td) {
     g_uhci_qh.element_ptr = phys_addr(first_td);
 
-    for (uint32_t i = 0; i < 2000000; i++) {
-        if (!(last_td->ctrl_status & UHCI_TD_CTRL_ACTIVE)) {
+    for (uint32_t i = 0; i < 100000000; i++) { // 100M iterations (~1-2 seconds)
+        if (!(*(volatile uint32_t*)&last_td->ctrl_status & UHCI_TD_CTRL_ACTIVE)) {
             g_uhci_qh.element_ptr = UHCI_PTR_T;
             return 1;
         }
     }
 
     g_uhci_qh.element_ptr = UHCI_PTR_T;
+    puts("usb: transaction timed out\n");
     return 0;
 }
 
@@ -498,7 +507,20 @@ static int uhci_single_transaction(
     g_uhci_tds[0].token = uhci_make_token(pid, address, endpoint, toggle, data_length);
     g_uhci_tds[0].buffer_ptr = data_length > 0 ? phys_addr(data) : 0;
     if (pid == UHCI_PID_IN) g_uhci_tds[0].ctrl_status |= UHCI_TD_CTRL_SPD;
-    return uhci_run_td_chain(info, &g_uhci_tds[0], &g_uhci_tds[0]) && !(g_uhci_tds[0].ctrl_status & UHCI_TD_CTRL_ACTIVE);
+    
+    if (!uhci_run_td_chain(info, &g_uhci_tds[0], &g_uhci_tds[0])) return 0;
+    
+    if (g_uhci_tds[0].ctrl_status & UHCI_TD_CTRL_ACTIVE) return 0;
+    
+    // Check for errors (bits 17-22 in UHCI TD Status)
+    if (g_uhci_tds[0].ctrl_status & 0x007E0000U) {
+        puts("usb: hardware error 0x");
+        print_hex32(g_uhci_tds[0].ctrl_status);
+        putchar('\n');
+        return 0;
+    }
+    
+    return 1;
 }
 
 static int uhci_control_transfer(
@@ -549,7 +571,13 @@ static int uhci_control_transfer(
     for (int i = 0; i < td_index; i++) g_uhci_tds[i].link_ptr = phys_addr(&g_uhci_tds[i + 1]);
     g_uhci_tds[td_index].link_ptr = UHCI_PTR_T;
 
-    return uhci_run_td_chain(info, &g_uhci_tds[0], &g_uhci_tds[td_index]) && !(g_uhci_tds[td_index].ctrl_status & UHCI_TD_CTRL_ACTIVE);
+    if (!uhci_run_td_chain(info, &g_uhci_tds[0], &g_uhci_tds[td_index])) return 0;
+    
+    for (int i = 0; i <= td_index; i++) {
+        if (g_uhci_tds[i].ctrl_status & (UHCI_TD_CTRL_ACTIVE | 0x007E0000U)) return 0;
+    }
+    
+    return 1;
 }
 
 static int uhci_get_device_descriptor(
@@ -602,6 +630,18 @@ static int uhci_set_configuration(const usb_controller_info_t *info, uint8_t low
     if (!uhci_control_transfer(info, low_speed, address, 8, setup, 0, 0, 0)) return 0;
     usb_delay();
     return 1;
+}
+
+static int uhci_clear_halt(const usb_controller_info_t *info, uint8_t low_speed, uint8_t address, uint8_t endpoint_address) {
+    usb_setup_packet_t *setup = &g_uhci_setup_packet;
+
+    setup->bm_request_type = 0x02; // Endpoint
+    setup->b_request = 0x01;       // CLEAR_FEATURE
+    setup->w_value = 0;            // ENDPOINT_HALT
+    setup->w_index = endpoint_address;
+    setup->w_length = 0;
+
+    return uhci_control_transfer(info, low_speed, address, 8, setup, 0, 0, 0);
 }
 
 static int uhci_get_configuration_descriptor(
@@ -798,6 +838,7 @@ static int usb_enumerate_mass_storage_device(
     }
 
     usb_print_descriptor_interfaces(g_uhci_data_buffer, total_length, &ms_info, verbose);
+
     if (!ms_info.found) {
         if (verbose) puts("  mass storage: no\n");
         return 0;
@@ -835,16 +876,19 @@ static int usb_mass_bulk_transfer(
     usb_mass_storage_session_t *session,
     uint8_t endpoint_address,
     void *buffer,
-    uint16_t length,
-    uint8_t max_packet
+    uint32_t length,
+    uint16_t max_packet
 ) {
     uint8_t pid = (endpoint_address & USB_DIR_IN) ? UHCI_PID_IN : UHCI_PID_OUT;
     uint8_t endpoint = endpoint_address & 0x0F;
     uint8_t *toggle = (endpoint_address & USB_DIR_IN) ? &session->bulk_in_toggle : &session->bulk_out_toggle;
     uint8_t *bytes = (uint8_t*)buffer;
-    uint16_t remaining = length;
+    uint32_t remaining = length;
+    uint32_t common_status = UHCI_TD_CTRL_ACTIVE | UHCI_TD_CTRL_CERR3;
 
-    if (!session || !toggle || max_packet == 0) return 0;
+    if (!session || max_packet == 0) return 0;
+    if (session->low_speed) common_status |= UHCI_TD_CTRL_LS;
+
     if (length == 0) {
         if (!uhci_single_transaction(&session->controller, session->low_speed, pid, session->address, endpoint, *toggle, 0, 0)) return 0;
         *toggle ^= 1;
@@ -852,17 +896,48 @@ static int usb_mass_bulk_transfer(
     }
 
     while (remaining > 0) {
-        uint16_t chunk = remaining > max_packet ? max_packet : remaining;
-        if (!uhci_single_transaction(&session->controller, session->low_speed, pid, session->address, endpoint, *toggle, bytes, chunk)) {
-            return 0;
+        int td_count = 0;
+        uhci_td_t *first_td = &g_uhci_tds[0];
+        uhci_td_t *last_td = 0;
+
+        kmemset(g_uhci_tds, 0, sizeof(g_uhci_tds));
+
+        while (remaining > 0 && td_count < UHCI_MAX_TDS) {
+            uint16_t chunk = (uint16_t)(remaining > max_packet ? max_packet : remaining);
+            uhci_td_t *td = &g_uhci_tds[td_count];
+
+            td->ctrl_status = common_status;
+            if (pid == UHCI_PID_IN) td->ctrl_status |= UHCI_TD_CTRL_SPD;
+            td->token = uhci_make_token(pid, session->address, endpoint, *toggle, chunk);
+            td->buffer_ptr = phys_addr(bytes);
+            
+            if (td_count > 0) g_uhci_tds[td_count - 1].link_ptr = phys_addr(td);
+            
+            last_td = td;
+            td_count++;
+            *toggle ^= 1;
+            bytes += chunk;
+            remaining -= chunk;
         }
-        *toggle ^= 1;
-        bytes += chunk;
-        remaining = (uint16_t)(remaining - chunk);
+
+        if (last_td) {
+            last_td->link_ptr = UHCI_PTR_T;
+            last_td->ctrl_status |= UHCI_TD_CTRL_IOC;
+            if (!uhci_run_td_chain(&session->controller, first_td, last_td)) return 0;
+            
+            for (int i = 0; i < td_count; i++) {
+                if (*(volatile uint32_t*)&g_uhci_tds[i].ctrl_status & (UHCI_TD_CTRL_ACTIVE | 0x007E0000U)) {
+                    // if it's a stall, we might need to clear it, but for now just return error
+                    return 0;
+                }
+            }
+        }
     }
 
     return 1;
 }
+
+static uint32_t g_usb_bot_tag_counter = 0x4D4C4A31U;
 
 static int usb_mass_bot_command(
     usb_mass_storage_session_t *session,
@@ -870,42 +945,54 @@ static int usb_mass_bot_command(
     uint8_t cdb_length,
     int data_in,
     void *data,
-    uint16_t data_length
+    uint32_t data_length
 ) {
-    usb_mass_cbw_t cbw;
-    usb_mass_csw_t csw;
-
     if (!session || !cdb || cdb_length > 16) return 0;
     if (!session->storage.bulk_in_endpoint || !session->storage.bulk_out_endpoint) return 0;
 
-    kmemset(&cbw, 0, sizeof(cbw));
-    kmemset(&csw, 0, sizeof(csw));
-    write_le32((uint8_t*)&cbw.d_cbw_signature, USB_CBW_SIGNATURE);
-    write_le32((uint8_t*)&cbw.d_cbw_tag, USB_MASS_TAG);
-    write_le32((uint8_t*)&cbw.d_cbw_data_transfer_length, data_length);
-    cbw.bm_cbw_flags = data_in ? USB_DIR_IN : 0;
-    cbw.b_cbw_lun = 0;
-    cbw.b_cbw_cb_length = cdb_length;
-    for (uint8_t i = 0; i < cdb_length; i++) cbw.cbwcb[i] = cdb[i];
+    uint32_t current_tag = g_usb_bot_tag_counter++;
 
-    if (!usb_mass_bulk_transfer(session, session->storage.bulk_out_endpoint, &cbw, sizeof(cbw), (uint8_t)session->storage.bulk_out_max_packet)) return 0;
+    kmemset(&g_usb_bot_cbw, 0, sizeof(g_usb_bot_cbw));
+    kmemset(&g_usb_bot_csw, 0, sizeof(g_usb_bot_csw));
+    write_le32((uint8_t*)&g_usb_bot_cbw.d_cbw_signature, USB_CBW_SIGNATURE);
+    write_le32((uint8_t*)&g_usb_bot_cbw.d_cbw_tag, current_tag);
+    write_le32((uint8_t*)&g_usb_bot_cbw.d_cbw_data_transfer_length, data_length);
+    g_usb_bot_cbw.bm_cbw_flags = data_in ? USB_DIR_IN : 0;
+    g_usb_bot_cbw.b_cbw_lun = 0;
+    g_usb_bot_cbw.b_cbw_cb_length = cdb_length;
+    for (uint8_t i = 0; i < cdb_length; i++) g_usb_bot_cbw.cbwcb[i] = cdb[i];
+
+    if (!usb_mass_bulk_transfer(session, session->storage.bulk_out_endpoint, &g_usb_bot_cbw, sizeof(g_usb_bot_cbw), session->storage.bulk_out_max_packet)) return 0;
     if (data_length > 0) {
         if (!usb_mass_bulk_transfer(
             session,
             data_in ? session->storage.bulk_in_endpoint : session->storage.bulk_out_endpoint,
             data,
             data_length,
-            data_in ? (uint8_t)session->storage.bulk_in_max_packet : (uint8_t)session->storage.bulk_out_max_packet
+            data_in ? session->storage.bulk_in_max_packet : session->storage.bulk_out_max_packet
         )) {
+            // stalled?
+            uhci_clear_halt(&session->controller, session->low_speed, session->address, data_in ? session->storage.bulk_in_endpoint : session->storage.bulk_out_endpoint);
             return 0;
         }
     }
-    if (!usb_mass_bulk_transfer(session, session->storage.bulk_in_endpoint, &csw, sizeof(csw), (uint8_t)session->storage.bulk_in_max_packet)) return 0;
-    if (read_le32((const uint8_t*)&csw.d_csw_signature) != USB_CSW_SIGNATURE) return 0;
-    if (read_le32((const uint8_t*)&csw.d_csw_tag) != USB_MASS_TAG) return 0;
-    if (csw.b_csw_status != 0) return 0;
+    if (!usb_mass_bulk_transfer(session, session->storage.bulk_in_endpoint, &g_usb_bot_csw, sizeof(g_usb_bot_csw), session->storage.bulk_in_max_packet)) {
+        uhci_clear_halt(&session->controller, session->low_speed, session->address, session->storage.bulk_in_endpoint);
+        return 0;
+    }
+    if (read_le32((const uint8_t*)&g_usb_bot_csw.d_csw_signature) != USB_CSW_SIGNATURE) return 0;
+    if (read_le32((const uint8_t*)&g_usb_bot_csw.d_csw_tag) != current_tag) return 0;
+    if (g_usb_bot_csw.b_csw_status != 0) {
+        puts("usb: CSW status error 0x");
+        print_hex8(g_usb_bot_csw.b_csw_status);
+        putchar('\n');
+        return 0;
+    }
+
     return 1;
 }
+
+
 
 static int usb_mass_inquiry(usb_mass_storage_session_t *session, uint8_t *out, uint16_t out_len) {
     uint8_t cdb[6];
@@ -928,7 +1015,7 @@ static int usb_mass_read_capacity10(usb_mass_storage_session_t *session, uint8_t
     return usb_mass_bot_command(session, cdb, sizeof(cdb), 1, out, 8);
 }
 
-static int usb_mass_read10(usb_mass_storage_session_t *session, uint32_t lba, uint16_t blocks, uint8_t *out, uint16_t out_len) {
+static int usb_mass_read10(usb_mass_storage_session_t *session, uint32_t lba, uint16_t blocks, uint8_t *out, uint32_t out_len) {
     uint8_t cdb[10];
     uint32_t transfer_len = (uint32_t)blocks * 512U;
 
@@ -938,7 +1025,19 @@ static int usb_mass_read10(usb_mass_storage_session_t *session, uint32_t lba, ui
     cdb[0] = 0x28;
     write_be32(&cdb[2], lba);
     write_be16(&cdb[7], blocks);
-    return usb_mass_bot_command(session, cdb, sizeof(cdb), 1, out, (uint16_t)transfer_len);
+    return usb_mass_bot_command(session, cdb, sizeof(cdb), 1, out, transfer_len);
+}
+
+static int usb_mass_write10(usb_mass_storage_session_t *session, uint32_t lba, uint16_t blocks, const uint8_t *data, uint32_t data_len) {
+    uint8_t cdb[10];
+    uint32_t transfer_len = (uint32_t)blocks * 512U;
+
+    if (!data || data_len < transfer_len || blocks == 0) return 0;
+    kmemset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x2A;
+    write_be32(&cdb[2], lba);
+    write_be16(&cdb[7], blocks);
+    return usb_mass_bot_command(session, cdb, sizeof(cdb), 0, (void*)data, transfer_len);
 }
 
 static void usb_print_ascii_trimmed(const uint8_t *text, uint16_t len) {
@@ -1055,7 +1154,7 @@ void cmd_usb_list(void) {
         putchar('\n');
     }
 
-    puts("usb: controller detection and UHCI root-port inspection are available; USB mass-storage driver is not implemented yet\n");
+    puts("usb: controller detection and UHCI root-port inspection are available; USB mass-storage driver is implemented\n");
 }
 
 void cmd_usb_ports(int controller_index) {
@@ -1183,8 +1282,34 @@ int usb_storage_read_sector(int index, uint32_t lba, uint8_t *buffer) {
     if (index < 0 || index >= g_usb_storage_device_count_cached || !buffer) return 0;
     if (g_usb_storage_devices[index].sector_size != 512U) return 0;
     if (lba >= g_usb_storage_devices[index].sector_count) return 0;
-    return usb_mass_read10(&g_usb_storage_sessions[index], lba, 1, buffer, 512);
+    
+    // Use aligned buffer for hardware compatibility
+    if (!usb_mass_read10(&g_usb_storage_sessions[index], lba, 1, g_uhci_data_buffer, 512)) return 0;
+    for (int i = 0; i < 512; i++) buffer[i] = g_uhci_data_buffer[i];
+    return 1;
 }
+
+int usb_storage_write_sector(int index, uint32_t lba, const uint8_t *buffer) {
+    usb_storage_scan_devices();
+    if (index < 0 || index >= g_usb_storage_device_count_cached || !buffer) return 0;
+    if (g_usb_storage_devices[index].sector_size != 512U) return 0;
+    if (lba >= g_usb_storage_devices[index].sector_count) return 0;
+    
+    // Copy to aligned buffer for hardware compatibility
+    for (int i = 0; i < 512; i++) g_uhci_data_buffer[i] = buffer[i];
+    return usb_mass_write10(&g_usb_storage_sessions[index], lba, 1, g_uhci_data_buffer, 512);
+}
+
+int usb_storage_test_ready(int index) {
+    usb_storage_scan_devices();
+    if (index < 0 || index >= g_usb_storage_device_count_cached) return 0;
+    
+    uint8_t cdb[6];
+    kmemset(cdb, 0, sizeof(cdb));
+    // Test Unit Ready (TUR) is 0x00
+    return usb_mass_bot_command(&g_usb_storage_sessions[index], cdb, sizeof(cdb), 1, 0, 0);
+}
+
 
 void cmd_usb_probe(int controller_index, int port_index) {
     usb_mass_storage_session_t session;
