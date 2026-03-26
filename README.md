@@ -1,6 +1,6 @@
 # mljOS
 
-`mljOS` is a small hobby operating system written in C and x86 Assembly.
+`meetlook just operation system - mljOS` is a small hobby operating system written in C and x86 Assembly.
 It boots through GRUB2, provides a basic shell, supports a tiny in-memory filesystem, and includes simple built-in applications.
 
 ## Features
