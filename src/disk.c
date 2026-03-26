@@ -1631,6 +1631,110 @@ void cmd_disk_ls(const char *path) {
     putchar('\n');
 }
 
+int disk_list_dir_file_names(const char *path, char *out, int out_size) {
+    uint32_t dir_cluster = g_fat32.root_cluster;
+    fat32_lookup_result_t target;
+    fat32_lookup_result_t item;
+    uint8_t sector[512];
+    uint32_t cluster;
+    char resolved_path[128];
+    char lfn_parts[20][40];
+    int lfn_count = 0;
+    uint8_t lfn_checksum = 0;
+    int lfn_valid = 0;
+    int pos = 0;
+
+    out[0] = '\0';
+    if (!out_size || !out) return 0;
+    if (!path) path = "/";
+
+    g_disk_io_error = 0;
+    if (!disk_require_active_device("disk ls")) return 0;
+    if (!fat32_mount()) return 0;
+
+    if (!fat32_normalize_path(path, resolved_path)) return 0;
+
+    if (strcmp(resolved_path, "/") != 0) {
+        if (!fat32_resolve_path(resolved_path, &dir_cluster, &target)) return 0;
+        if (!(target.entry.attr & FAT32_ATTR_DIRECTORY)) return 0;
+        dir_cluster = fat32_dir_first_cluster(&target.entry);
+    }
+
+    cluster = dir_cluster;
+    while (cluster >= 2 && !is_fat32_eoc(cluster)) {
+        uint32_t cluster_lba = fat32_cluster_to_lba(cluster);
+        for (uint8_t sec = 0; sec < g_fat32.sectors_per_cluster; sec++) {
+            if (!ata_read_sector(cluster_lba + sec, sector)) {
+                g_disk_io_error = 1;
+                return 0;
+            }
+            for (int offset = 0; offset < 512; offset += 32) {
+                fat32_dir_entry_t *dir_entry = (fat32_dir_entry_t *)&sector[offset];
+                if (dir_entry->name[0] == 0x00) {
+                    out[pos] = '\0';
+                    return 1;
+                }
+                if (dir_entry->name[0] == 0xE5) {
+                    lfn_count = 0;
+                    lfn_valid = 0;
+                    continue;
+                }
+                if (dir_entry->attr == FAT32_ATTR_LFN) {
+                    fat32_lfn_entry_t *lfn = (fat32_lfn_entry_t *)dir_entry;
+                    int seq = lfn->order & 0x1F;
+                    if (seq >= 1 && seq <= 20) {
+                        fat32_decode_lfn_entry(lfn, lfn_parts[seq - 1]);
+                        if (lfn->order & 0x40) {
+                            lfn_count = seq;
+                            lfn_checksum = lfn->checksum;
+                            lfn_valid = 1;
+                        }
+                    }
+                    continue;
+                }
+
+                kmemset(&item, 0, sizeof(item));
+                kmemcpy(&item.entry, dir_entry, sizeof(*dir_entry));
+
+                if (lfn_valid && lfn_count > 0 && lfn_checksum == fat32_lfn_checksum(dir_entry->name)) {
+                    int p = 0;
+                    item.has_long_name = 1;
+                    for (int i = 0; i < lfn_count; i++) {
+                        for (int j = 0; lfn_parts[i][j] && p < 127; j++) item.display_name[p++] = lfn_parts[i][j];
+                    }
+                    item.display_name[p] = '\0';
+                } else {
+                    fat32_lookup_set_short_name(&item);
+                }
+
+                lfn_count = 0;
+                lfn_valid = 0;
+
+                if (item.display_name[0] == '.' &&
+                    (item.display_name[1] == '\0' ||
+                     (item.display_name[1] == '.' && item.display_name[2] == '\0'))) {
+                    continue;
+                }
+
+                if (item.entry.attr & FAT32_ATTR_DIRECTORY) continue;
+                if (!item.display_name[0]) continue;
+
+                if (pos > 0 && pos < out_size - 1) out[pos++] = '\n';
+                for (int i = 0; item.display_name[i] && pos < out_size - 1; i++) out[pos++] = item.display_name[i];
+                if (pos >= out_size - 1) {
+                    out[pos] = '\0';
+                    return 1;
+                }
+            }
+        }
+        cluster = fat32_read_fat_entry(cluster);
+        if (g_disk_io_error) return 0;
+    }
+
+    out[pos] = '\0';
+    return 1;
+}
+
 void disk_prepare_session(void) {
     (void)disk_current_device();
     fat32_reset_cwd();
@@ -2065,15 +2169,15 @@ int disk_read_file(const char *path, char *out, int maxlen, uint32_t *size_out) 
 int disk_load_user_config(char *out, int maxlen) {
     g_disk_io_error = 0;
     if (!fat32_mount()) return 0;
-    return disk_read_text_file_internal("/etc/users.cfg", out, maxlen);
+    return disk_read_text_file_internal("/system/users.cfg", out, maxlen);
 }
 
 int disk_save_user_config(const char *text) {
     g_disk_io_error = 0;
     if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
-    if (!fat32_ensure_directory_quiet("/etc")) return 0;
-    return disk_write_file_internal("/etc/users.cfg", text ? text : "", text ? strlen(text) : 0);
+    if (!fat32_ensure_directory_quiet("/system")) return 0;
+    return disk_write_file_internal("/system/users.cfg", text ? text : "", text ? strlen(text) : 0);
 }
 
 int disk_ensure_directory(const char *path) {

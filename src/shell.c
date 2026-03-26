@@ -14,6 +14,9 @@ static void os_set_cursor(int row, int col);
 static void os_putchar_at(char ch, int row, int col);
 static int os_read_key(void);
 
+// Used to pass an optional file path to apps (e.g., `edit <path>`).
+static char g_edit_open_path[128];
+
 mljos_api_t os_api = {
     .puts = puts,
     .putchar = putchar,
@@ -23,7 +26,8 @@ mljos_api_t os_api = {
     .write_file = app_write_file,
     .set_cursor = os_set_cursor,
     .putchar_at = os_putchar_at,
-    .read_key = os_read_key
+    .read_key = os_read_key,
+    .open_path = g_edit_open_path,
 };
 
 #define HISTORY_SIZE 16
@@ -126,6 +130,9 @@ static void handle_command(char *line);
 static int shell_disk_primary_mode(void);
 static int shell_try_launch_app_command(const char *name);
 static void shell_exec_app_command(const char *name);
+static int shell_try_launch_script_command(const char *name);
+static int shell_exec_script_file(const char *path, int quiet_errors);
+static void shell_run_autorun_scripts(void);
 
 static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out) {
     if (shell_disk_primary_mode() || active_storage == STORAGE_DISK) {
@@ -598,7 +605,9 @@ static void print_storage_help(void) {
     puts("Files: ls [path], cd <path>, pwd, mkdir <path>, mkdir -p <path>, rmdir <path>, touch <path>, rm <path>, cat <path>, write <path> <text>, cp <src> <dst>\n");
     puts("Disk: disk devices, disk use <n>, disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
     puts("Apps: bundled apps are stored in /apps and can be launched by name, like calc or edit\n");
+    puts("Editor: `edit [path]` opens a file in the built-in editor\n");
     puts("System: install, exec <app|path>, usb, clear, help, shutdown, reboot\n");
+    puts("Scripts: .scri in /system/autorun run on boot (run by typing file name)\n");
     print_usb_help();
 }
 
@@ -1001,6 +1010,124 @@ static void run_install_wizard(void) {
     puts("install: filesystem and users copied to disk\n");
 }
 
+static int shell_ends_with(const char *text, const char *suffix) {
+    unsigned int text_len = strlen(text);
+    unsigned int suffix_len = strlen(suffix);
+    if (suffix_len > text_len) return 0;
+    return strcmp(text + (text_len - suffix_len), suffix) == 0;
+}
+
+static char *shell_trim_left(char *s) {
+    while (s && (*s == ' ' || *s == '\t')) s++;
+    return s;
+}
+
+static void shell_path_join(char *out, int out_size, const char *dir, const char *leaf) {
+    int pos = 0;
+    if (!out || out_size <= 0) return;
+
+    if (dir) {
+        while (dir[pos] && pos < out_size - 1) {
+            out[pos] = dir[pos];
+            pos++;
+        }
+    }
+
+    if (pos > 0 && out[pos - 1] != '/' && pos < out_size - 1) out[pos++] = '/';
+
+    if (leaf) {
+        for (int i = 0; leaf[i] && pos < out_size - 1; i++) out[pos++] = leaf[i];
+    }
+
+    out[pos] = '\0';
+}
+
+static int shell_exec_script_file(const char *path, int quiet_errors) {
+    enum { SCRIPT_BUF_SIZE = 4096, LINE_BUF_SIZE = 128 };
+    char script_buf[SCRIPT_BUF_SIZE];
+    char line_buf[LINE_BUF_SIZE];
+    unsigned int script_size = 0;
+    unsigned int i = 0;
+    int read_ok = 0;
+
+    if (!path || !path[0]) return 0;
+
+    // app_read_file chooses RAM vs disk based on current shell state.
+    read_ok = app_read_file(path, script_buf, (int)sizeof(script_buf) - 1, &script_size);
+    if (!read_ok) {
+        if (!quiet_errors) {
+            puts("script: unable to read ");
+            puts(path);
+            putchar('\n');
+        }
+        return 0;
+    }
+
+    while (i < script_size) {
+        unsigned int l = 0;
+
+        while (i < script_size && script_buf[i] != '\n' && script_buf[i] != '\r') {
+            if (l < sizeof(line_buf) - 1) line_buf[l++] = script_buf[i];
+            i++;
+        }
+
+        line_buf[l] = '\0';
+
+        if (i < script_size && script_buf[i] == '\r') i++;
+        if (i < script_size && script_buf[i] == '\n') i++;
+
+        char *cmd = shell_trim_left(line_buf);
+        if (!cmd[0] || cmd[0] == '#') continue;
+
+        handle_command(cmd);
+    }
+
+    return 1;
+}
+
+static int shell_try_launch_script_command(const char *name) {
+    if (!name || !name[0]) return 0;
+    if (!shell_ends_with(name, ".scri")) return 0;
+
+    // Consider it "handled" by extension: if it exists but can't be read,
+    // show an error instead of falling back to "Unknown command".
+    (void)shell_exec_script_file(name, 0);
+    return 1;
+}
+
+static void shell_run_autorun_scripts(void) {
+    char names_buf[1024];
+    const char *dir_path = "/system/autorun";
+    int ok;
+    int p = 0;
+    char script_path[192];
+
+    names_buf[0] = '\0';
+
+    if (shell_disk_primary_mode() || active_storage == STORAGE_DISK)
+        ok = disk_list_dir_file_names(dir_path, names_buf, (int)sizeof(names_buf));
+    else
+        ok = fs_list_dir_file_names(dir_path, names_buf, (int)sizeof(names_buf));
+
+    if (!ok || !names_buf[0]) return;
+
+    while (names_buf[p]) {
+        int n = 0;
+        char filename[64];
+
+        while (names_buf[p] && names_buf[p] != '\n' && n < (int)sizeof(filename) - 1) {
+            filename[n++] = names_buf[p++];
+        }
+        filename[n] = '\0';
+        if (names_buf[p] == '\n') p++;
+
+        if (shell_ends_with(filename, ".scri")) {
+            shell_path_join(script_path, (int)sizeof(script_path), dir_path, filename);
+            (void)shell_exec_script_file(script_path, 1);
+        }
+    }
+}
+
 static void handle_command(char *line) {
     uint8_t old_color = COLOR;
     char line_copy[128];
@@ -1115,6 +1242,21 @@ static void handle_command(char *line) {
             join_args(joined, sizeof(joined), argv, 2, argc);
             cmd_write_active(argv[1], joined);
         } else puts("write: missing file or text\n");
+    } else if (strcmp(argv[0], "edit") == 0) {
+        if (argc > 1) {
+            // Allow `edit "some path.txt"` by re-joining all remaining args.
+            join_args(joined, sizeof(joined), argv, 1, argc);
+            strncpy(g_edit_open_path, joined, sizeof(g_edit_open_path));
+            g_edit_open_path[sizeof(g_edit_open_path) - 1] = '\0';
+        } else {
+            g_edit_open_path[0] = '\0';
+        }
+
+        shell_exec_app_command("edit");
+
+        // Clear after launching app to avoid leaking path into the next run
+        // (especially when opening is triggered without an explicit argument).
+        g_edit_open_path[0] = '\0';
     } else if (strcmp(argv[0], "disk") == 0) {
         if (argc < 2) puts("disk: missing command (devices, use, format, ls, cd, pwd, mkdir, write, cat, rm)\n");
         else if (strcmp(argv[1], "devices") == 0 || strcmp(argv[1], "list") == 0) {
@@ -1211,6 +1353,8 @@ static void handle_command(char *line) {
             puts("usb: unknown command\n");
             print_usb_help();
         }
+    } else if (shell_try_launch_script_command(argv[0])) {
+        // Script executed.
     } else if (!shell_try_launch_app_command(argv[0])) {
         COLOR = COLOR_ERROR;
         puts("Unknown command: ");
@@ -1249,6 +1393,7 @@ void shell_run(void) {
         users_end_sudo();
     }
     g_jmp_ready = 1;
+    shell_run_autorun_scripts();
 
     {
         char linebuf[128];

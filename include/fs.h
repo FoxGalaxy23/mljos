@@ -51,6 +51,7 @@ void cmd_chown(const char *owner_name, const char *path);
 void cmd_ram_exec(const char *path);
 int fs_resolve_app_command(const char *name, char *out, int out_size);
 int fs_can_exec_path(const char *path);
+int fs_list_dir_file_names(const char *path, char *out, int out_size);
 int fs_read_file(const char *path, char *out, int maxlen, uint32_t *size_out);
 int fs_write_file(const char *path, const char *data, uint32_t size);
 

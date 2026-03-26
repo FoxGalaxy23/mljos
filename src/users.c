@@ -620,7 +620,8 @@ void users_bootstrap_fs(void) {
     fs_ensure_dir("/home", 0, 0, 0755);
     fs_ensure_dir("/root", 0, 0, 0700);
     fs_ensure_dir("/tmp", 0, 0, 0777);
-    fs_ensure_dir("/etc", 0, 0, 0755);
+    fs_ensure_dir("/system", 0, 0, 0755);
+    fs_ensure_dir("/system/autorun", 0, 0, 0755);
 
     for (int i = 0; i < g_user_count; i++) {
         const user_account_t *user = &g_users[i];

@@ -31,6 +31,47 @@ void _start(mljos_api_t *api) {
     filename[0] = '\0';
     temporary_msg[0] = '\0';
 
+    if (api && api->open_path && api->open_path[0]) {
+        // Show the opened path in the UI so Ctrl+O can save back to it.
+        copy_str(filename, api->open_path, sizeof(filename));
+
+        char buffer[4096];
+        unsigned int size_out = 0;
+        buffer[0] = '\0';
+
+        if (api->read_file(api->open_path, buffer, sizeof(buffer), &size_out)) {
+            // Reset editor buffer, then split on '\n'.
+            num_lines = 0;
+            cx = 0;
+            cy = 0;
+            scroll_y = 0;
+
+            int p = 0;
+            while (buffer[p] && num_lines < MAX_LINES) {
+                int cur_line = num_lines;
+                int cur_col = 0;
+
+                while (buffer[p] && buffer[p] != '\n' && cur_col < MAX_COLS - 1) {
+                    lines[cur_line][cur_col++] = buffer[p++];
+                }
+
+                lines[cur_line][cur_col] = '\0';
+                line_lens[cur_line] = cur_col;
+                num_lines++;
+
+                if (buffer[p] == '\n') p++; // Skip newline between lines
+            }
+
+            if (num_lines == 0) {
+                num_lines = 1;
+                line_lens[0] = 0;
+            }
+        } else {
+            copy_str(temporary_msg, "Error opening file!", sizeof(temporary_msg));
+            num_lines = 1; // Keep editor empty
+        }
+    }
+
     draw_screen(api);
 
     while (1) {

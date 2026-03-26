@@ -11,6 +11,7 @@ typedef struct {
     void (*set_cursor)(int row, int col);
     void (*putchar_at)(char ch, int row, int col);
     int (*read_key)(void);
+    const char *open_path; // Optional: path to open on app startup (edit, etc.)
 } mljos_api_t;
 
 #endif

@@ -892,6 +892,34 @@ int fs_can_exec_path(const char *path) {
     return 1;
 }
 
+int fs_list_dir_file_names(const char *path, char *out, int out_size) {
+    fs_node_t *dir;
+    fs_node_t *child;
+    int pos = 0;
+    int first = 1;
+
+    if (!out || out_size <= 0) return 0;
+    out[0] = '\0';
+    if (!path || !path[0]) dir = current_dir;
+    else dir = fs_resolve_node(current_dir, path);
+
+    if (!dir || dir->flags != FS_DIR) return 0;
+    if (!fs_has_perm(dir, FS_PERM_READ)) return 0;
+
+    child = dir->child;
+    while (child && pos < out_size - 1) {
+        if (child->flags == FS_FILE) {
+            if (!first && pos < out_size - 1) out[pos++] = '\n';
+            first = 0;
+            for (int i = 0; child->name[i] && pos < out_size - 1; i++) out[pos++] = child->name[i];
+        }
+        child = child->sibling;
+    }
+
+    out[pos] = '\0';
+    return 1;
+}
+
 void cmd_ram_exec(const char *path) {
     fs_node_t *file = fs_resolve_node(current_dir, path);
 
