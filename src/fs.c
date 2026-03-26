@@ -7,6 +7,7 @@
 #include "apps/calc_app.h"
 #include "apps/edit_app.h"
 #include "apps/microcoder_app.h"
+#include "apps/mcrunner_app.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -447,6 +448,12 @@ void fs_init(void) {
     if (microcoder) {
         microcoder->size = microcoder_app_size;
         microcoder->content = (char*)microcoder_app_data;
+    }
+
+    fs_node_t *mcrunner = fs_create_node(apps_dir ? apps_dir : fs_root, "mcrunner.app", FS_FILE, 0, 0, 0755);
+    if (mcrunner) {
+        mcrunner->size = mcrunner_app_size;
+        mcrunner->content = (char*)mcrunner_app_data;
     }
 }
 

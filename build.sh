@@ -93,6 +93,9 @@ with header_path.open('w') as f:
     APP_ELFS="$APP_ELFS $app_elf"
 done
 
+# Special case for mcrunner (it is a stub, but we build it like an app)
+# It's already included in the loop above because it's in apps/*.c
+
 echo "Compiling kernel sources..."
 OBJECTS=""
 for src in "$ROOT_DIR"/src/*.c; do

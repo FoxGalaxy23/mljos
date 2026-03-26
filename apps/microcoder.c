@@ -10,78 +10,69 @@
 
 #include "sdk/mljos_api.h"
 
+// Prototypes
+static int compile_and_run(mljos_api_t *api, const char *program_text, const char *output_path);
+static int strlen(const char *s);
+static void strcpy(char *dst, const char *src);
+
+#define MAX_NODES 512
+#define MAX_CODE 1000
+#define MAX_STACK 256
+#define MAX_PROGRAM_LEN 4096
+
 #ifndef NULL
 #define NULL ((void*)0)
 #endif
 
-#define MAX_LINE_LEN 256
-#define MAX_PROGRAM_LEN 4096
-
-#define MAX_NODES 4096
-#define MAX_CODE 1000
-#define MAX_STACK 1000
-
-// ----- Lexer -----
-enum {
-    DO_SYM,
-    ELSE_SYM,
-    IF_SYM,
-    WHILE_SYM,
-    LBRA,
-    RBRA,
-    LPAR,
-    RPAR,
-    PLUS,
-    MINUS,
-    LESS,
-    SEMI,
-    EQUAL,
-    GREATER,
-    MUL,
-    DIV,
-    MOD,
-    GE,
-    LE,
-    EQ,
-    NE,
-    INT,
-    ID,
-    FOR_SYM,
-    PRINT_SYM,
-    EOI
-};
-
-static const char *g_src;
-static int g_pos;
-static int g_ch;
-static int g_sym;
-static int g_int_val;
-static char g_id_name[32];
-
-static int g_error;
-static const char *g_error_msg;
-
-// Prototypes
-static int compile_and_run(mljos_api_t *api, const char *program_text);
-
 void _start(mljos_api_t *api) {
-    if (!api->open_path || !api->open_path[0]) {
-        api->puts("Tiny-C microcoder for mljOS\n");
-        api->puts("Usage: microcoder <file.tc>\n");
+    if (!api || !api->open_path || !api->open_path[0]) {
+        if (api) {
+            api->puts("Tiny-C microcoder for mljOS\n");
+            api->puts("Usage: microcoder <file.tc> [output.app]\n");
+        }
         return;
     }
+    char *file_path = api->open_path;
+    char *output_path = NULL;
 
-    char program_text[MAX_PROGRAM_LEN];
+    static char path_buf[128];
+    strcpy(path_buf, api->open_path);
+    char *p = path_buf;
+    while (*p && *p != ' ') p++;
+    if (*p == ' ') {
+        *p = '\0';
+        file_path = path_buf;
+        output_path = p + 1;
+        while (*output_path == ' ') output_path++;
+    }
+
+    char program_text[4096];
     unsigned int size = 0;
 
-    if (api->read_file(api->open_path, program_text, sizeof(program_text) - 1, &size)) {
+    if (api->read_file(file_path, program_text, sizeof(program_text) - 1, &size)) {
         program_text[size] = '\0';
-        compile_and_run(api, program_text);
+        compile_and_run(api, program_text, output_path);
     } else {
         api->puts("Tiny-C error: could not read file '");
-        api->puts(api->open_path);
+        api->puts(file_path);
         api->puts("'\n");
     }
+}
+
+// ----- Global helpers -----
+static int strlen(const char *s) {
+    int i = 0;
+    while (s && s[i]) i++;
+    return i;
+}
+
+static void strcpy(char *dst, const char *src) {
+    int i = 0;
+    while (src[i]) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
 }
 
 static int streq(const char *a, const char *b) {
@@ -92,6 +83,23 @@ static int streq(const char *a, const char *b) {
     }
     return (!a || !b) ? 0 : (a[i] == b[i]);
 }
+
+// ----- Lexer -----
+enum {
+    DO_SYM, ELSE_SYM, IF_SYM, WHILE_SYM, LBRA, RBRA, LPAR, RPAR,
+    PLUS, MINUS, LESS, SEMI, EQUAL, GREATER, MUL, DIV, MOD,
+    GE, LE, EQ, NE, INT, ID, FOR_SYM, PRINT_SYM, EOI
+};
+
+static const char *g_src = 0;
+static int g_pos = 0;
+static int g_ch = 0;
+static int g_sym = 0;
+static int g_int_val = 0;
+static char g_id_name[32] = {0};
+
+static int g_error = 0;
+static const char *g_error_msg = 0;
 
 static void syntax_error(const char *msg) {
     g_error = 1;
@@ -327,8 +335,8 @@ typedef struct node {
     int val;
 } node;
 
-static node g_pool[MAX_NODES];
-static int g_pool_used;
+static node g_pool[MAX_NODES] = {{0}};
+static int g_pool_used = 0;
 
 static node *new_node(int k) {
     if (g_error) return NULL;
@@ -635,8 +643,8 @@ enum {
 
 typedef signed char code;
 
-static code g_object[MAX_CODE];
-static code *g_here;
+static code g_object[MAX_CODE] = {0};
+static code *g_here = 0;
 
 static void emit(code c) {
     if (g_error) return;
@@ -812,160 +820,199 @@ static void gen(node *x) {
     }
 }
 
-// ----- VM -----
-static int g_globals[26];
-static int g_vm_stack[MAX_STACK];
-
-static void print_int(mljos_api_t *api, int v) {
-    if (!api) return;
-    if (v == 0) {
-        api->putchar('0');
-        return;
-    }
-
-    if (v < 0) {
-        api->putchar('-');
-        v = -v;
-    }
-
-    char buf[16];
-    int n = 0;
-    while (v > 0 && n < (int)sizeof(buf)) {
-        buf[n++] = (char)('0' + (v % 10));
-        v /= 10;
-    }
-    while (n-- > 0) api->putchar(buf[n]);
-}
-
-static void run_vm(mljos_api_t *api) {
-    int *sp = g_vm_stack;
-    code *pc = g_object;
-
-    for (int i = 0; i < 26; i++) g_globals[i] = 0;
-
-    again:
-    switch (*pc++) {
-        case IFETCH:
-            *sp++ = g_globals[*pc++];
-            goto again;
-        case ISTORE:
-            g_globals[*pc++] = sp[-1];
-            goto again;
-        case IPUSH: {
-            int v = (unsigned char)(*pc++);
-            v |= (unsigned char)(*pc++) << 8;
-            v |= (unsigned char)(*pc++) << 16;
-            v |= (unsigned char)(*pc++) << 24;
-            *sp++ = v;
-            goto again;
-        }
-        case IPOP:
-            --sp;
-            goto again;
-        case IADD:
-            sp[-2] = sp[-2] + sp[-1];
-            --sp;
-            goto again;
-        case ISUB:
-            sp[-2] = sp[-2] - sp[-1];
-            --sp;
-            goto again;
-        case IMUL:
-            sp[-2] = sp[-2] * sp[-1];
-            --sp;
-            goto again;
-        case IDIV:
-            if (sp[-1] != 0) sp[-2] = sp[-2] / sp[-1];
-            else sp[-2] = 0;
-            --sp;
-            goto again;
-        case IMOD:
-            if (sp[-1] != 0) sp[-2] = sp[-2] % sp[-1];
-            else sp[-2] = 0;
-            --sp;
-            goto again;
-        case ILT:
-            sp[-2] = (sp[-2] < sp[-1]);
-            --sp;
-            goto again;
-        case IGT:
-            sp[-2] = (sp[-2] > sp[-1]);
-            --sp;
-            goto again;
-        case IGE:
-            sp[-2] = (sp[-2] >= sp[-1]);
-            --sp;
-            goto again;
-        case ILE:
-            sp[-2] = (sp[-2] <= sp[-1]);
-            --sp;
-            goto again;
-        case IEQ:
-            sp[-2] = (sp[-2] == sp[-1]);
-            --sp;
-            goto again;
-        case INE:
-            sp[-2] = (sp[-2] != sp[-1]);
-            --sp;
-            goto again;
-        case JMP:
-            pc += *pc;
-            goto again;
-        case JZ:
-            if (*--sp == 0) pc += *pc;
-            else pc++;
-            goto again;
-        case JNZ:
-            if (*--sp != 0) pc += *pc;
-            else pc++;
-            goto again;
-        case IPRINT:
-            print_int(api, *--sp);
-            api->putchar('\n');
-            goto again;
-        case HALT:
-            break;
-        default:
-            break;
-    }
-
-}
-
-static int compile_and_run(mljos_api_t *api, const char *program_text) {
+static int compile_and_run(mljos_api_t *api, const char *program_text, const char *output_path) {
     g_error = 0;
-    g_error_msg = NULL;
     lexer_init(program_text);
-
+    node *root = program();
     if (g_error) {
-        api->puts("Tiny-C error: ");
+        api->puts("Tiny-C compilation error: ");
         api->puts(g_error_msg);
         api->putchar('\n');
         return 0;
     }
 
-    // Build AST.
-    g_pool_used = 0;
-    node *root = program();
-    if (g_error || !root) {
-        api->puts("Tiny-C error: ");
-        api->puts(g_error_msg ? g_error_msg : "syntax error");
-        api->putchar('\n');
-        return 0;
-    }
-
-    // Generate bytecode.
     g_here = g_object;
     gen(root);
     if (g_error) {
-        api->puts("Tiny-C error: ");
-        api->puts(g_error_msg ? g_error_msg : "codegen error");
+        api->puts("Tiny-C code generation error: ");
+        api->puts(g_error_msg);
         api->putchar('\n');
         return 0;
     }
 
-    // Execute.
-    run_vm(api);
-    return 1;
+    int code_len = (int)(g_here - g_object);
+
+    if (output_path) {
+        api->puts("Compiling to ");
+        api->puts(output_path);
+        api->puts("...\n");
+
+        // Compile to .app
+        static char runner_buf[32768];
+        unsigned int runner_size = 0;
+        
+        if (!api->read_file("/apps/mcrunner.app", runner_buf, sizeof(runner_buf), &runner_size)) {
+            api->puts("Tiny-C error: could not read /apps/mcrunner.app stub\n");
+            return 0;
+        }
+
+        // We build the output in a buffer
+        static char out_buf[16000];
+        unsigned int out_pos = 0;
+        
+        for (unsigned int i = 0; i < runner_size; i++) out_buf[out_pos++] = runner_buf[i];
+        
+        // Marker "MCBYTE"
+        out_buf[out_pos++] = 'M';
+        out_buf[out_pos++] = 'C';
+        out_buf[out_pos++] = 'B';
+        out_buf[out_pos++] = 'Y';
+        out_buf[out_pos++] = 'T';
+        out_buf[out_pos++] = 'E';
+        
+        // Bytecode
+        for (int i = 0; i < code_len; i++) out_buf[out_pos++] = (char)g_object[i];
+        
+        if (api->write_file(output_path, out_buf, out_pos)) {
+            api->puts("Successfully compiled to ");
+            api->puts(output_path);
+            api->putchar('\n');
+        } else {
+            api->puts("Tiny-C error: could not write output file\n");
+        }
+        return 1;
+    }
+
+    // VM state (Interpreter mode)
+    int stack[MAX_STACK];
+    int sp = 0;
+    int vars[26];
+    for (int i = 0; i < 26; i++) vars[i] = 0;
+
+    code *pc = g_object;
+    while (1) {
+        code instr = *pc++;
+        switch (instr) {
+            case IFETCH: {
+                int reg = (int)(*pc++);
+                stack[sp++] = vars[reg];
+                break;
+            }
+            case ISTORE: {
+                int reg = (int)(*pc++);
+                vars[reg] = stack[--sp];
+                break;
+            }
+            case IPUSH: {
+                int v = (unsigned char)(pc[0]) | ((unsigned char)(pc[1]) << 8) | ((unsigned char)(pc[2]) << 16) | ((unsigned char)(pc[3]) << 24);
+                pc += 4;
+                stack[sp++] = v;
+                break;
+            }
+            case IPOP:
+                sp--;
+                break;
+            case IADD: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = a + b;
+                break;
+            }
+            case ISUB: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = a - b;
+                break;
+            }
+            case IMUL: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = a * b;
+                break;
+            }
+            case IDIV: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (b != 0) ? a / b : 0;
+                break;
+            }
+            case IMOD: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (b != 0) ? a % b : 0;
+                break;
+            }
+            case ILT: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a < b);
+                break;
+            }
+            case IGT: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a > b);
+                break;
+            }
+            case IGE: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a >= b);
+                break;
+            }
+            case ILE: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a <= b);
+                break;
+            }
+            case IEQ: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a == b);
+                break;
+            }
+            case INE: {
+                int b = stack[--sp];
+                int a = stack[--sp];
+                stack[sp++] = (a != b);
+                break;
+            }
+            case JZ: {
+                int off = (int)(*pc++);
+                if (stack[--sp] == 0) pc += off;
+                break;
+            }
+            case JNZ: {
+                int off = (int)(*pc++);
+                if (stack[--sp] != 0) pc += off;
+                break;
+            }
+            case JMP: {
+                int off = (int)(*pc++);
+                pc += off;
+                break;
+            }
+            case IPRINT: {
+                int v = stack[--sp];
+                if (v < 0) { api->putchar('-'); v = -v; }
+                if (v == 0) { api->putchar('0'); }
+                else {
+                    char buf[12];
+                    int i = 0;
+                    while (v > 0) { buf[i++] = (char)((v % 10) + '0'); v /= 10; }
+                    while (i > 0) api->putchar(buf[--i]);
+                }
+                api->putchar('\n');
+                break;
+            }
+            case HALT:
+                return 1;
+            default:
+                api->puts("Tiny-C runtime error: unknown instruction\n");
+                return 0;
+        }
+    }
 }
 
 
