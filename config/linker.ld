@@ -17,6 +17,7 @@ SECTIONS
   .multiboot ALIGN(8) : ALIGN(8)
   {
     KEEP(*(.multiboot))
+    KEEP(*(.multiboot2))
   } :text
 
   .text ALIGN(8) : ALIGN(8)

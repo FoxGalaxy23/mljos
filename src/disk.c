@@ -2,7 +2,6 @@
 #include "console.h"
 #include "io.h"
 #include "kstring.h"
-#include "bootsector.h"
 #include "shell.h"
 #include "sdk/mljos_api.h"
 #include "usb.h"
@@ -454,6 +453,14 @@ static uint32_t ata_identify_total_sectors(ata_device_t *device) {
         identify[i * 2 + 1] = (uint8_t)(word >> 8);
     }
 
+    // Check for LBA48 support (word 83, bit 10)
+    uint16_t feat = (uint16_t)identify[166] | ((uint16_t)identify[167] << 8);
+    if (feat & (1 << 10)) {
+        // Return 32-bit field from LBA48 capacity (words 100-103)
+        // Since our OS uses 32-bit LBA internally, we cap it at 4 billion sectors (2TB)
+        return read_le32(&identify[200]);
+    }
+
     return read_le32(&identify[120]);
 }
 
@@ -624,9 +631,8 @@ static int fat32_mount(void) {
     if (sector[510] != 0x55 || sector[511] != 0xAA) return 0;
 
     if (read_le16(&sector[11]) != 512 || read_le32(&sector[36]) == 0) {
-        uint8_t part_type = sector[450];
         uint32_t part_lba = read_le32(&sector[454]);
-        if (!((part_type == 0x0B || part_type == 0x0C) && part_lba > 0)) return 0;
+        if (part_lba == 0) return 0;
         if (!ata_read_sector(part_lba, sector)) return 0;
         if (sector[510] != 0x55 || sector[511] != 0xAA) return 0;
         if (read_le16(&sector[11]) != 512 || read_le32(&sector[36]) == 0) return 0;
@@ -1497,8 +1503,10 @@ void cmd_disk_format(void) {
     puts(device->label);
     puts(")...\n");
 
+    puts("Clearing MBR and FAT area...\n");
     ata_write_zero_sectors(0, 1);
     ata_write_zero_sectors(partition_lba, reserved_sector_count);
+    // Initial zeroing of FAT area - we do this once.
     ata_write_zero_sectors(partition_lba + reserved_sector_count, num_fats * fat_size);
     if (g_disk_io_error) {
         puts("disk format: disk write failed while clearing metadata area (I/O error)\n");
@@ -1507,7 +1515,7 @@ void cmd_disk_format(void) {
 
 
     kmemset(mbr, 0, sizeof(mbr));
-    mbr[446 + 4] = 0x0C;
+    mbr[446 + 4] = 0xEF; // EFI System Partition (instead of 0x0C)
     write_le32(&mbr[446 + 8], partition_lba);
     write_le32(&mbr[446 + 12], volume_sectors);
     mbr[510] = 0x55;
@@ -1571,11 +1579,12 @@ void cmd_disk_format(void) {
         return;
     }
 
-    ata_write_zero_sectors(partition_lba + reserved_sector_count + 1, fat_size - 1);
-    ata_write_zero_sectors(partition_lba + reserved_sector_count + fat_size + 1, fat_size - 1);
+    // We already zeroed the rest of the FAT area above, so we don't need to do it again here.
+    // This redundant zeroing was making USB formatting very slow.
+    // Just zero the cluster following the FAT area (root directory first cluster)
     ata_write_zero_sectors(partition_lba + reserved_sector_count + (num_fats * fat_size), sectors_per_cluster);
     if (g_disk_io_error) {
-        puts("disk format: disk write failed while zeroing FAT/data region (I/O error)\n");
+        puts("disk format: disk write failed while zeroing data region (I/O error)\n");
         return;
     }
 
@@ -2404,29 +2413,9 @@ void cmd_disk_install(void) {
     puts("Installing OS to disk...");
     putchar('\n');
 
-    if (!ata_read_sector(0, sector0)) {
-        puts("Failed to read MBR\n");
-        return;
-    }
-
-    for (uint32_t i = 0; i < 446; i++) {
-        sector0[i] = i < sizeof(bootsector_data) ? bootsector_data[i] : 0;
-    }
-
-    sector0[BOOTSECTOR_PATCH_OFFSET] = (uint8_t)(num_sectors & 0xFF);
-    sector0[BOOTSECTOR_PATCH_OFFSET + 1] = (uint8_t)((num_sectors >> 8) & 0xFF);
-    sector0[BOOTSECTOR_PATCH_OFFSET + 2] = (uint8_t)((num_sectors >> 16) & 0xFF);
-    sector0[BOOTSECTOR_PATCH_OFFSET + 3] = (uint8_t)((num_sectors >> 24) & 0xFF);
-
-    if (!ata_write_sector(0, sector0)) {
-        puts("Failed to write bootloader to MBR\n");
-        return;
-    }
-
-    if (num_sectors > 2047) {
-        puts("Kernel is too large to fit in unpartitioned space!\n");
-        return;
-    }
+    puts("Preparing installation files...\n");
+    // BIOS/Legacy: Write kernel to sector 1+
+    // UEFI: Files will be synced from RAM FS to FAT32
 
     uint8_t *kmem = (uint8_t *)kernel_start;
     for (uint32_t i = 0; i < num_sectors; i++) {

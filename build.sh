@@ -15,7 +15,7 @@ INCLUDE_FLAGS="-I$ROOT_DIR/include -I$GENERATED_INCLUDE_DIR"
 CFLAGS="-m64 -nostdlib -nostdinc -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -mno-red-zone"
 APP_CFLAGS="$CFLAGS"
 
-DEPS="gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu nasm grub-pc-bin grub-common xorriso mtools"
+DEPS="gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu nasm grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools ovmf git make gcc clang lld autoconf automake libtool mtools nasm"
 
 echo "Checking for missing dependencies..."
 MISSING_DEPS=""
@@ -35,31 +35,71 @@ else
 fi
 
 echo "Preparing build directories..."
+# 1. Создаем папку limine
+mkdir -p limine
+
+# 2. Скачиваем файл (теперь папка есть, и ошибки не будет)
+curl -L https://github.com/limine-bootloader/limine/raw/v7.x-binary/BOOTX64.EFI -o limine/BOOTX64.EFI
+
+# 3. Проверяем, что файл скачался (должно быть около 232k)
+ls -lh limine/BOOTX64.EFI
+
 mkdir -p "$OBJ_DIR" "$APP_BUILD_DIR" "$GENERATED_INCLUDE_DIR/apps" "$ISO_DIR/boot/grub"
 cp "$ROOT_DIR/config/grub.cfg" "$ISO_DIR/boot/grub/grub.cfg"
 
-echo "Generating bootsector.h..."
-nasm -f bin "$ROOT_DIR/boot/bootsector.asm" -o "$BUILD_DIR/bootsector.bin"
-python3 -c '
+echo "Preparing bootloader payload headers..."
+LIMINE_EFI_SRC=""
+for candidate in \
+    "$ROOT_DIR/limine/BOOTX64.EFI" \
+    "$ROOT_DIR/limine/bin/BOOTX64.EFI" \
+    "/usr/share/limine/BOOTX64.EFI" \
+    "/usr/share/limine/bootx64.efi" \
+    "/usr/local/share/limine/BOOTX64.EFI" \
+    "/usr/local/share/limine/bootx64.efi"; do
+    if [ -f "$candidate" ]; then
+        LIMINE_EFI_SRC="$candidate"
+        break
+    fi
+done
+
+python3 -c "
 import pathlib
 import sys
 
-root = pathlib.Path("'"$ROOT_DIR"'")
-build_dir = pathlib.Path("'"$BUILD_DIR"'")
-bootsector_path = build_dir / "bootsector.bin"
-header_path = build_dir / "include" / "bootsector.h"
-data = bootsector_path.read_bytes()
-idx = data.find(b"\xB9\x00\x00\x00\x00")
-if idx == -1:
-    sys.exit(1)
-offset = idx + 1
-with header_path.open("w") as f:
-    f.write("#ifndef BOOTSECTOR_H\n#define BOOTSECTOR_H\n\n")
-    f.write(f"#define BOOTSECTOR_PATCH_OFFSET {offset}\n\n")
-    f.write("static const unsigned char bootsector_data[] = {\n")
-    f.write("    " + ", ".join(f"0x{b:02x}" for b in data) + "\n")
-    f.write("};\n\n#endif\n")
-'
+def write_header(header_path: pathlib.Path, symbol: str, data: bytes) -> None:
+    guard = header_path.name.replace('.', '_').upper()
+    with header_path.open('w') as f:
+        f.write(f'#ifndef {guard}\\n#define {guard}\\n\\n')
+        f.write(f'static const unsigned int {symbol}_size = {len(data)};\\n')
+        if data:
+            f.write(f'static const unsigned char {symbol}_data[] = {{\\n')
+            f.write('    ' + ', '.join(f'0x{b:02x}' for b in data) + '\\n')
+            f.write('};\\n\\n')
+        else:
+            f.write(f'static const unsigned char {symbol}_data[] = {{0x00}};\\n\\n')
+        f.write('#endif\\n')
+
+root = pathlib.Path('$GENERATED_INCLUDE_DIR')
+boot_dir = root / 'boot'
+boot_dir.mkdir(parents=True, exist_ok=True)
+
+src_raw = '$LIMINE_EFI_SRC'.strip()
+src = pathlib.Path(src_raw) if src_raw else None
+data = src.read_bytes() if src and src.is_file() else b''
+write_header(boot_dir / 'limine_bootx64_efi.h', 'limine_bootx64_efi', data)
+" 
+
+if [ -n "$LIMINE_EFI_SRC" ]; then
+    echo "Found Limine UEFI binary: $LIMINE_EFI_SRC"
+else
+    echo "Error: Limine BOOTX64.EFI not found."
+    echo "Install Limine and ensure one of these exists:"
+    echo "  - $ROOT_DIR/limine/BOOTX64.EFI"
+    echo "  - $ROOT_DIR/limine/bin/BOOTX64.EFI"
+    echo "  - /usr/local/share/limine/BOOTX64.EFI"
+    echo "  - /usr/share/limine/BOOTX64.EFI"
+    exit 1
+fi
 
 echo "Building apps..."
 APP_ELFS=""

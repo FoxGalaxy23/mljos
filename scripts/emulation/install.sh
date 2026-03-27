@@ -9,5 +9,6 @@ chmod +x "$SCRIPT_DIR"/start_virtual_machine.sh \
     "$SCRIPT_DIR"/start_virtual_machine_with_only_iso.sh \
     "$SCRIPT_DIR"/make_hardrive.sh \
     "$SCRIPT_DIR"/start_virtual_machine_with_iso.sh \
+    "$SCRIPT_DIR"/start_virtual_machine_uefi.sh \
     "$SCRIPT_DIR"/make_usb_stick.sh \
     "$SCRIPT_DIR"/fast_test.sh

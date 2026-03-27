@@ -1,6 +1,6 @@
 # mljOS
 
-`meetlook just operation system - mljOS` is a small hobby operating system written in C and x86 Assembly.
+`mljOS` is a small hobby operating system written in C and x86 Assembly.
 It boots through GRUB2, provides a basic shell, supports a tiny in-memory filesystem, and includes simple built-in applications.
 
 ## Features
@@ -82,12 +82,19 @@ Run with both disk and ISO attached:
 ./scripts/emulation/start_virtual_machine_with_iso.sh
 ```
 
+Run installed system from disk in UEFI mode (without ISO):
+
+```bash
+./scripts/emulation/start_virtual_machine_uefi.sh
+```
+
 Inside the OS, use `disk devices` to list detected ATA disks and `disk use <n>` to switch the active one.
 Use `usb`, `usb ports <controller>`, `usb reset <controller> <port>`, `usb probe <controller> <port>`, `usb storage <controller> <port>`, and `usb read <controller> <port> [lba]` to inspect PCI USB controllers and UHCI root ports. If `build/usb.img` exists, the QEMU start scripts attach it as a USB mass-storage device for diagnostics.
 
 ## Notes
 
 - `build.sh` may try to install missing packages automatically through `apt`.
+- For UEFI disk boot without ISO, install host packages `limine` and `ovmf`.
 - Generated files are stored in `build/` and ignored by Git.
 - This project is a hobby OS and is best treated as an educational playground.
 - The `usb` command currently detects PCI USB controllers, inspects UHCI root-port state, and can read a basic USB device descriptor through `usb probe`.

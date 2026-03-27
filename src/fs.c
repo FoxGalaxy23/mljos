@@ -18,6 +18,11 @@
 #include "apps/clear_app.h"
 #include "apps/time_app.h"
 #include "apps/date_app.h"
+#include "boot/limine_bootx64_efi.h"
+#include "common.h"
+
+extern uint8_t _kernel_start[];
+extern uint8_t _kernel_end[];
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -499,6 +504,41 @@ void fs_init(void) {
 
     fs_node_t *date = fs_create_node(apps_dir ? apps_dir : fs_root, "date.app", FS_FILE, 0, 0, 0755);
     if (date) { date->size = date_app_size; date->content = (char*)date_app_data; }
+
+    // UEFI shell fallback: auto-launch default bootloader path.
+    fs_node_t *startup = fs_create_node(fs_root, "startup.nsh", FS_FILE, 0, 0, 0644);
+    if (startup) {
+        static const char *startup_script = "fs0:\\EFI\\BOOT\\BOOTX64.EFI\n";
+        startup->size = (uint32_t)strlen(startup_script);
+        startup->content = (char*)startup_script;
+    }
+
+    // UEFI/Bootloader entries
+    fs_ensure_dir("/boot", 0, 0, 0755);
+    fs_node_t *boot_dir = fs_resolve_node(fs_root, "/boot");
+    if (boot_dir) {
+        fs_node_t *kbin = fs_create_node(boot_dir, "mljos.bin", FS_FILE, 0, 0, 0644);
+        if (kbin) {
+            kbin->size = (uint32_t)((uintptr_t)_kernel_end - (uintptr_t)_kernel_start);
+            kbin->content = (char*)_kernel_start;
+        }
+        
+        static const char *cfg = "TIMEOUT=0\n\n:mljOS\n    PROTOCOL=limine\n    KERNEL_PATH=boot:///boot/mljos.bin\n";
+        fs_node_t *lcfg = fs_create_node(boot_dir, "limine.cfg", FS_FILE, 0, 0, 0644);
+        if (lcfg) { lcfg->size = (uint32_t)strlen(cfg); lcfg->content = (char*)cfg; }
+        fs_node_t *lconf = fs_create_node(boot_dir, "limine.conf", FS_FILE, 0, 0, 0644);
+        if (lconf) { lconf->size = (uint32_t)strlen(cfg); lconf->content = (char*)cfg; }
+    }
+
+    fs_ensure_dir("/EFI/BOOT", 0, 0, 0755);
+    fs_node_t *efi_dir = fs_resolve_node(fs_root, "/EFI/BOOT");
+    if (efi_dir) {
+        fs_node_t *ebin = fs_create_node(efi_dir, "BOOTX64.EFI", FS_FILE, 0, 0, 0644);
+        if (ebin && limine_bootx64_efi_size > 0) {
+            ebin->size = limine_bootx64_efi_size;
+            ebin->content = (char*)limine_bootx64_efi_data;
+        }
+    }
 }
 
 void fs_ensure_dir(const char *path, uint16_t uid, uint16_t gid, uint16_t mode) {

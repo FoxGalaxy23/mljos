@@ -96,9 +96,11 @@ static void os_putchar_at(char ch, int row, int col) {
 
 static int os_read_key(void) {
     while (1) {
-        while (!(inb(0x64) & 1)) {
+        int timeout = 1000000;
+        while (!(inb(0x64) & 1) && timeout-- > 0) {
             __asm__ volatile ("nop");
         }
+        if (timeout <= 0) return 0;
         uint8_t sc = inb(0x60);
         char c = 0;
 
@@ -366,9 +368,11 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
     update_cursor();
 
     while (1) {
-        while (!(inb(0x64) & 1)) {
+        int timeout = 1000000;
+        while (!(inb(0x64) & 1) && timeout-- > 0) {
             __asm__ volatile ("nop");
         }
+        if (timeout <= 0) continue;
 
         {
             uint8_t sc = inb(0x60);
