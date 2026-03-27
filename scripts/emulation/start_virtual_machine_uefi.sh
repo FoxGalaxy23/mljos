@@ -28,7 +28,10 @@ if [ -f "$ROOT_DIR/build/usb.img" ]; then
 fi
 
 BOOT_ORDER="c"
-if [ -f "$ROOT_DIR/build/mljOS.iso" ]; then
+if [ -f "$ROOT_DIR/build_user/mljOS.iso" ]; then
+    ISO_ARGS+=("-cdrom" "$ROOT_DIR/build_user/mljOS.iso")
+    BOOT_ORDER="d"
+elif [ -f "$ROOT_DIR/build/mljOS.iso" ]; then
     ISO_ARGS+=("-cdrom" "$ROOT_DIR/build/mljOS.iso")
     BOOT_ORDER="d"
 fi

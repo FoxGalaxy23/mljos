@@ -1,4 +1,5 @@
 #include "shell.h"
+#include "gui.h"
 #include "console.h"
 
 struct multiboot_tag {
@@ -30,6 +31,6 @@ void kernel_main(uintptr_t mbi) {
         tag = (struct multiboot_tag *)((uintptr_t)tag + ((tag->size + 7) & ~7));
     }
 
-    puts("Welcome to mljOS (UEFI Mode via Multiboot 2)\n");
+    gui_init();
     shell_run();
 }

@@ -23,8 +23,19 @@ struct framebuffer {
 };
 
 extern struct framebuffer fb;
+// Root framebuffer info (полн. экран). `fb` ниже — активный viewport консоли.
+extern struct framebuffer fb_root;
 
 void console_init(uint32_t *addr, uint32_t w, uint32_t h, uint32_t p);
+// Настраивает активный viewport консоли (в пикселях относительно fb_root).
+// Параметры размера будут округлены вниз до кратности CHAR_WIDTH/CHAR_HEIGHT.
+void console_set_viewport(uint32_t origin_x_px, uint32_t origin_y_px, uint32_t w_px, uint32_t h_px);
+// Управляет тем, будет ли консоль рисовать пиксели в framebuffer.
+// Буфер (текст) при этом продолжает обновляться, чтобы содержимое можно было перерисовать.
+void console_set_visible(int visible);
+int console_is_visible(void);
+// Полная перерисовка текста из буфера в текущий viewport.
+void console_redraw(void);
 void scroll_if_needed(void);
 void putchar_at(char ch, int row, int col);
 void putchar(char ch);

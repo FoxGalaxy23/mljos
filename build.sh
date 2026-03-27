@@ -4,6 +4,10 @@ set -e
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
+# Если build/ занят root-ом (часто после неудачных прошлых сборок), собираем в build_user/
+if [ ! -w "$BUILD_DIR" ]; then
+    BUILD_DIR="$ROOT_DIR/build_user"
+fi
 OBJ_DIR="$BUILD_DIR/obj"
 APP_BUILD_DIR="$BUILD_DIR/apps"
 GENERATED_INCLUDE_DIR="$BUILD_DIR/include"
@@ -38,11 +42,14 @@ echo "Preparing build directories..."
 # 1. Создаем папку limine
 mkdir -p limine
 
-# 2. Скачиваем файл (теперь папка есть, и ошибки не будет)
-curl -L https://github.com/limine-bootloader/limine/raw/v7.x-binary/BOOTX64.EFI -o limine/BOOTX64.EFI
+# 2. Скачиваем файл только если его нет.
+# В некоторых окружениях файл может быть owned by root и недоступен для перезаписи.
+if [ ! -f limine/BOOTX64.EFI ]; then
+    curl -L https://github.com/limine-bootloader/limine/raw/v7.x-binary/BOOTX64.EFI -o limine/BOOTX64.EFI
+fi
 
-# 3. Проверяем, что файл скачался (должно быть около 232k)
-ls -lh limine/BOOTX64.EFI
+# 3. Проверяем, что файл существует (должно быть около 232k)
+ls -lh limine/BOOTX64.EFI || true
 
 mkdir -p "$OBJ_DIR" "$APP_BUILD_DIR" "$GENERATED_INCLUDE_DIR/apps" "$ISO_DIR/boot/grub"
 cp "$ROOT_DIR/config/grub.cfg" "$ISO_DIR/boot/grub/grub.cfg"

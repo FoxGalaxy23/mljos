@@ -26,4 +26,9 @@ if [ -f "$ROOT_DIR/build/usb.img" ]; then
     USB_ARGS+=("-device" "usb-storage,bus=uhci.0,drive=usbstick")
 fi
 
-qemu-system-x86_64 $KVM_OPTS -m 4G "${DISK_ARGS[@]}" "${USB_ARGS[@]}" -cdrom "$ROOT_DIR/build/mljOS.iso" -boot d
+ISO_PATH="$ROOT_DIR/build/mljOS.iso"
+if [ -f "$ROOT_DIR/build_user/mljOS.iso" ]; then
+  ISO_PATH="$ROOT_DIR/build_user/mljOS.iso"
+fi
+
+qemu-system-x86_64 $KVM_OPTS -m 4G "${DISK_ARGS[@]}" "${USB_ARGS[@]}" -cdrom "$ISO_PATH" -boot d

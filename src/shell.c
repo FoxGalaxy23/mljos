@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "console.h"
+#include "gui.h"
 #include "disk.h"
 #include "fs.h"
 #include "io.h"
@@ -55,6 +56,8 @@ mljos_api_t os_api = {
     .get_time = os_get_time,
     .get_date = os_get_date,
     .open_path = g_edit_open_path,
+    .launch_flags = 0,
+    .ui = NULL,
 };
 
 #define HISTORY_SIZE 16
@@ -80,6 +83,77 @@ static const char scancode_map_shift[128] = {
 static int g_kbd_shift = 0;
 static int g_kbd_ctrl = 0;
 static int g_kbd_caps = 0;
+static int g_kbd_alt = 0;
+static int g_kbd_extended = 0;
+
+static uint32_t g_launch_flags = 0;
+
+static void kbd_handle_modifier_scancode(uint8_t sc) {
+    // Extended scancode prefix handling (0xE0). We treat right ctrl/alt as ctrl/alt.
+    if (sc == 0xE0) {
+        g_kbd_extended = 1;
+        return;
+    }
+
+    if (!g_kbd_extended) {
+        if (sc == 0x2A || sc == 0x36) { g_kbd_shift = 1; return; }
+        if (sc == 0xAA || sc == 0xB6) { g_kbd_shift = 0; return; }
+        if (sc == 0x1D) { g_kbd_ctrl = 1; return; }
+        if (sc == 0x9D) { g_kbd_ctrl = 0; return; }
+        if (sc == 0x3A) { g_kbd_caps = !g_kbd_caps; return; }
+        if (sc == 0x38) { g_kbd_alt = 1; return; }
+        if (sc == 0xB8) { g_kbd_alt = 0; return; }
+        return;
+    }
+
+    // Extended modifiers (E0 xx)
+    if (sc == 0x1D) { g_kbd_ctrl = 1; g_kbd_extended = 0; return; } // Right Ctrl make
+    if (sc == 0x9D) { g_kbd_ctrl = 0; g_kbd_extended = 0; return; } // Right Ctrl break
+    if (sc == 0x38) { g_kbd_alt = 1; g_kbd_extended = 0; return; }  // Right Alt make
+    if (sc == 0xB8) { g_kbd_alt = 0; g_kbd_extended = 0; return; }  // Right Alt break
+
+    // For any other extended scancode, leave extended flag set for the caller to consume,
+    // but don't keep it sticky across multiple bytes.
+}
+
+static int kbd_is_break(uint8_t sc) {
+    return (sc & 0x80) != 0;
+}
+
+static uint8_t kbd_strip_break(uint8_t sc) {
+    return (uint8_t)(sc & 0x7F);
+}
+
+static int kbd_translate_arrow(uint8_t sc_make, int extended) {
+    // Return special codes used by shell for arrows:
+    // 1000 up, 1001 down, 1002 left, 1003 right.
+    // In many environments arrows are sent as E0 48/50/4B/4D.
+    if (!extended) return 0;
+    if (sc_make == 0x48) return 1000;
+    if (sc_make == 0x50) return 1001;
+    if (sc_make == 0x4B) return 1002;
+    if (sc_make == 0x4D) return 1003;
+    return 0;
+}
+
+static uint32_t ui_screen_w_impl(void) { return gui_ui_screen_w(); }
+static uint32_t ui_screen_h_impl(void) { return gui_ui_screen_h(); }
+static void ui_fill_rect_impl(int x, int y, int w, int h, uint32_t rgb) { gui_ui_fill_rect(x, y, w, h, rgb); }
+static void ui_draw_text_impl(const char *s, int x, int y, uint32_t rgb) { gui_ui_draw_text(s, x, y, rgb); }
+static void ui_begin_app_impl(const char *title) { gui_ui_begin_app(title); }
+static void ui_end_app_impl(void) { gui_ui_end_app(); }
+
+static int ui_poll_event_impl(mljos_ui_event_t *out_event);
+
+static mljos_ui_api_t g_ui_api = {
+    .screen_w = ui_screen_w_impl,
+    .screen_h = ui_screen_h_impl,
+    .fill_rect = ui_fill_rect_impl,
+    .draw_text = ui_draw_text_impl,
+    .begin_app = ui_begin_app_impl,
+    .end_app = ui_end_app_impl,
+    .poll_event = ui_poll_event_impl,
+};
 
 static void *g_shell_jmp_env[8];
 static int g_jmp_ready = 0;
@@ -101,19 +175,61 @@ static int os_read_key(void) {
             __asm__ volatile ("nop");
         }
         if (timeout <= 0) return 0;
+        uint8_t st = inb(0x64);
+        if (st & 0x20) {
+            // AUX data (PS/2 mouse)
+            uint8_t mb = inb(0x60);
+            gui_mouse_push_byte(mb);
+            gui_tick();
+            continue;
+        }
         uint8_t sc = inb(0x60);
         char c = 0;
 
-        if (sc == 0x2A || sc == 0x36) { g_kbd_shift = 1; continue; }
-        if (sc == 0xAA || sc == 0xB6) { g_kbd_shift = 0; continue; }
-        if (sc == 0x1D) { g_kbd_ctrl = 1; continue; }
-        if (sc == 0x9D) { g_kbd_ctrl = 0; continue; }
-        if (sc == 0x3A) { g_kbd_caps = !g_kbd_caps; continue; }
+        // Modifiers + extended prefix
+        kbd_handle_modifier_scancode(sc);
+        if (sc == 0xE0) continue;
+        if (!g_kbd_extended) {
+            if (sc == 0x2A || sc == 0x36 || sc == 0xAA || sc == 0xB6 ||
+                sc == 0x1D || sc == 0x9D || sc == 0x3A || sc == 0x38 || sc == 0xB8) continue;
+        } else {
+            if (sc == 0x1D || sc == 0x9D || sc == 0x38 || sc == 0xB8) continue;
+        }
 
-        if (sc == 0x48) return 1000;
-        if (sc == 0x50) return 1001;
-        if (sc == 0x4B) return 1002;
-        if (sc == 0x4D) return 1003;
+        // Горячие клавиши UI (делаются до обработки обычных символов).
+        {
+            int extended = g_kbd_extended;
+            uint8_t sc_make = kbd_strip_break(sc);
+            int is_break = kbd_is_break(sc);
+
+            // Consume extended flag for this byte.
+            g_kbd_extended = 0;
+
+            if (!is_break && g_kbd_alt) {
+            // Alt+Enter -> DOS/GUI toggle
+                if (!extended && sc_make == 0x1C) { gui_toggle_dos_mode(); continue; }
+            // Alt+Backspace -> minimize/restore
+                if (!extended && sc_make == 0x0E) { gui_toggle_minimize_terminal(); continue; }
+            // Alt+Space -> restore (если свернуто)
+                if (!extended && sc_make == 0x39) { gui_restore_terminal(); continue; }
+            // Alt+Esc -> close/minimize
+                if (!extended && sc_make == 0x01) { gui_toggle_minimize_terminal(); continue; }
+            // Alt+R -> force GUI redraw (recovery)
+                if (!extended && (sc_make == 0x13)) { gui_force_redraw(); continue; } // 'r'
+
+            // Alt+Arrows -> move window by 1 character cell.
+                if (extended && sc_make == 0x48) { gui_move_terminal(0, -1); continue; } // Up
+                if (extended && sc_make == 0x50) { gui_move_terminal(0, 1); continue; }  // Down
+                if (extended && sc_make == 0x4B) { gui_move_terminal(-1, 0); continue; } // Left
+                if (extended && sc_make == 0x4D) { gui_move_terminal(1, 0); continue; }  // Right
+            }
+
+            // Arrow keys for apps/shell navigation
+            if (!is_break) {
+                int arrow = kbd_translate_arrow(sc_make, extended);
+                if (arrow) { gui_tick(); return arrow; }
+            }
+        }
 
         if (sc & 0x80) continue;
 
@@ -134,8 +250,81 @@ static int os_read_key(void) {
                 if (base >= 'a' && base <= 'z') return base - 'a' + 1;
             }
         }
-        if (c != 0) return c;
+        if (c != 0) { gui_tick(); return c; }
     }
+}
+
+void shell_set_launch_flags(uint32_t flags) {
+    g_launch_flags = flags;
+}
+
+static int ui_poll_event_impl(mljos_ui_event_t *out_event) {
+    if (!out_event) return 0;
+    out_event->type = MLJOS_UI_EVENT_NONE;
+    out_event->x = 0;
+    out_event->y = 0;
+    out_event->key = 0;
+
+    // Mouse click latches from GUI driver.
+    if (gui_ui_consume_expose()) {
+        out_event->type = MLJOS_UI_EVENT_EXPOSE;
+        out_event->x = 0;
+        out_event->y = 0;
+        return 1;
+    }
+    if (gui_ui_consume_left_pressed()) {
+        out_event->type = MLJOS_UI_EVENT_MOUSE_LEFT_DOWN;
+        out_event->x = gui_ui_mouse_x();
+        out_event->y = gui_ui_mouse_y();
+        return 1;
+    }
+    if (gui_ui_consume_left_released()) {
+        out_event->type = MLJOS_UI_EVENT_MOUSE_LEFT_UP;
+        out_event->x = gui_ui_mouse_x();
+        out_event->y = gui_ui_mouse_y();
+        return 1;
+    }
+
+    // Non-blocking poll.
+    if (!(inb(0x64) & 1)) return 0;
+
+    uint8_t st = inb(0x64);
+    if (st & 0x20) {
+        // AUX mouse byte
+        uint8_t mb = inb(0x60);
+        gui_mouse_push_byte(mb);
+        gui_tick();
+        // Don't spam mouse-move events: apps should redraw only on clicks/keys/timer.
+        return 0;
+    }
+
+    // Keyboard byte -> KEY_DOWN if translatable
+    uint8_t sc = inb(0x60);
+    char c = 0;
+
+    kbd_handle_modifier_scancode(sc);
+    if (sc == 0xE0) return 0;
+    if (!g_kbd_extended) {
+        if (sc == 0x2A || sc == 0x36 || sc == 0xAA || sc == 0xB6 ||
+            sc == 0x1D || sc == 0x9D || sc == 0x3A || sc == 0x38 || sc == 0xB8) return 0;
+    } else {
+        if (sc == 0x1D || sc == 0x9D || sc == 0x38 || sc == 0xB8) return 0;
+    }
+
+    if (sc & 0x80) { g_kbd_extended = 0; return 0; } // ignore key-up
+
+    if (sc < 128) {
+        int is_letter = ((sc >= 0x10 && sc <= 0x19) || (sc >= 0x1E && sc <= 0x26) || (sc >= 0x2C && sc <= 0x32));
+        int use_shift = g_kbd_shift;
+        if (g_kbd_caps && is_letter) use_shift = !use_shift;
+        c = use_shift ? scancode_map_shift[sc] : scancode_map_normal[sc];
+    }
+
+    gui_tick();
+    if (!c) return 0;
+    out_event->type = MLJOS_UI_EVENT_KEY_DOWN;
+    out_event->key = (int32_t)c;
+    return 1;
 }
 
 static storage_target_t resolve_storage(const char *path, const char **out_path) {
@@ -218,7 +407,7 @@ static int history_pos = -1;
 static void handle_command(char *line);
 static int shell_disk_primary_mode(void);
 static int shell_try_launch_app_command(const char *name);
-static void shell_exec_app_command(const char *name);
+void shell_exec_app_command(const char *name);
 static int shell_try_launch_script_command(const char *name);
 static int shell_exec_script_file(const char *path, int quiet_errors);
 static void shell_run_autorun_scripts(void);
@@ -375,16 +564,65 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
         if (timeout <= 0) continue;
 
         {
+            uint8_t st = inb(0x64);
+            if (st & 0x20) {
+                // AUX data (PS/2 mouse)
+                uint8_t mb = inb(0x60);
+                gui_mouse_push_byte(mb);
+                gui_tick();
+                continue;
+            }
             uint8_t sc = inb(0x60);
             char c = 0;
 
-            if (sc == 0x2A || sc == 0x36) { g_kbd_shift = 1; continue; }
-            if (sc == 0xAA || sc == 0xB6) { g_kbd_shift = 0; continue; }
-            if (sc == 0x1D) { g_kbd_ctrl = 1; continue; }
-            if (sc == 0x9D) { g_kbd_ctrl = 0; continue; }
-            if (sc == 0x3A) { g_kbd_caps = !g_kbd_caps; continue; }
+            // Modifiers + extended prefix
+            kbd_handle_modifier_scancode(sc);
+            if (sc == 0xE0) continue;
+            if (!g_kbd_extended) {
+                if (sc == 0x2A || sc == 0x36 || sc == 0xAA || sc == 0xB6 ||
+                    sc == 0x1D || sc == 0x9D || sc == 0x3A || sc == 0x38 || sc == 0xB8) continue;
+            } else {
+                if (sc == 0x1D || sc == 0x9D || sc == 0x38 || sc == 0xB8) continue;
+            }
 
-            if (sc == 0x48) {
+            // UI hotkeys (Alt+...)
+            {
+                int extended = g_kbd_extended;
+                uint8_t sc_make = kbd_strip_break(sc);
+                int is_break = kbd_is_break(sc);
+
+                // Consume extended flag for this byte.
+                g_kbd_extended = 0;
+
+                if (!is_break && g_kbd_alt) {
+                    if (!extended && sc_make == 0x1C) { gui_toggle_dos_mode(); continue; } // Enter
+                    if (!extended && sc_make == 0x0E) { gui_toggle_minimize_terminal(); continue; } // Backspace
+                    if (!extended && sc_make == 0x39) { gui_restore_terminal(); continue; } // Space
+                    if (!extended && sc_make == 0x01) { gui_toggle_minimize_terminal(); continue; } // Esc
+
+                    // Alt+Arrows for window move (prefer extended arrows).
+                    if (extended && sc_make == 0x48) { gui_move_terminal(0, -1); continue; } // Up
+                    if (extended && sc_make == 0x50) { gui_move_terminal(0, 1); continue; }  // Down
+                    if (extended && sc_make == 0x4B) { gui_move_terminal(-1, 0); continue; } // Left
+                    if (extended && sc_make == 0x4D) { gui_move_terminal(1, 0); continue; }  // Right
+                }
+
+                if (!is_break) {
+                    int arrow = kbd_translate_arrow(sc_make, extended);
+                    if (arrow) {
+                        // Reuse existing history navigation behavior by mapping to legacy scancodes below.
+                        // We'll handle them here to keep behavior identical regardless of extended/non-extended.
+                        if (arrow == 1000) sc_make = 0x48;
+                        else if (arrow == 1001) sc_make = 0x50;
+                        else if (arrow == 1002) sc_make = 0x4B;
+                        else if (arrow == 1003) sc_make = 0x4D;
+                        // fallthrough: process sc_make as if it were the original scancode.
+                        // Note: extended arrows are consumed; we don't want to translate them into characters.
+                    }
+                }
+            }
+
+            if ((sc & 0x7F) == 0x48 && !(sc & 0x80)) {
                 if (!allow_history || history_count == 0) continue;
                 if (history_pos < 0) history_pos = 0;
                 else if (history_pos < HISTORY_SIZE - 1) history_pos++;
@@ -412,7 +650,7 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
                 continue;
             }
 
-            if (sc == 0x50) {
+            if ((sc & 0x7F) == 0x50 && !(sc & 0x80)) {
                 if (!allow_history || history_count == 0) continue;
                 if (history_pos <= 0) {
                     history_pos = -1;
@@ -444,7 +682,7 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
                 continue;
             }
 
-            if (sc == 0x4B) {
+            if ((sc & 0x7F) == 0x4B && !(sc & 0x80)) {
                 if (len > 0) {
                     if (cursor_col == 0) {
                         if (cursor_row > 0) {
@@ -457,7 +695,7 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
                 continue;
             }
 
-            if (sc == 0x4D) {
+            if ((sc & 0x7F) == 0x4D && !(sc & 0x80)) {
                 if (len < maxlen - 1) {
                     if (cursor_col == VGA_COLS - 1) {
                         cursor_col = 0;
@@ -686,15 +924,19 @@ static int shell_try_launch_app_command(const char *name) {
     return 1;
 }
 
-static void shell_exec_app_command(const char *name) {
+void shell_exec_app_command(const char *name) {
     char app_path[128];
+    uint32_t prev_flags = os_api.launch_flags;
+    os_api.launch_flags = g_launch_flags;
 
     if (!name || !name[0]) {
         puts("exec: missing application name\n");
+        os_api.launch_flags = prev_flags;
         return;
     }
     if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) {
         puts("exec: invalid application name\n");
+        os_api.launch_flags = prev_flags;
         return;
     }
 
@@ -723,6 +965,8 @@ static void shell_exec_app_command(const char *name) {
     } else {
         cmd_ram_exec(app_path);
     }
+
+    os_api.launch_flags = prev_flags;
 }
 
 static void enter_logged_user_home(void) {
@@ -1364,6 +1608,7 @@ static void handle_command(char *line) {
 }
 
 void shell_run(void) {
+    os_api.ui = &g_ui_api;
     users_init();
     (void)users_load_from_disk();
     fs_init();
