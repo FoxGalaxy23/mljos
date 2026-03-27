@@ -1,4 +1,5 @@
 #include "fs.h"
+#include "app_layout.h"
 #include "console.h"
 #include "disk.h"
 #include "kstring.h"
@@ -1043,7 +1044,7 @@ void cmd_ram_exec(const char *path) {
     }
 
     {
-        char *app_start = (char *)0x800000;
+        char *app_start = (char *)(uintptr_t)MLJOS_APP_VADDR;
         for (uint32_t i = 0; i < file->size; i++) app_start[i] = file->content[i];
         ((app_entry_t)app_start)(&os_api);
     }

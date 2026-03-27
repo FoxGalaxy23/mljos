@@ -1,6 +1,9 @@
-#include "shell.h"
-#include "gui.h"
 #include "console.h"
+#include "launcher.h"
+#include "shell.h"
+#include "task.h"
+#include "terminal_app.h"
+#include "wm.h"
 
 struct multiboot_tag {
     uint32_t type;
@@ -31,6 +34,22 @@ void kernel_main(uintptr_t mbi) {
         tag = (struct multiboot_tag *)((uintptr_t)tag + ((tag->size + 7) & ~7));
     }
 
-    gui_init();
-    shell_run();
+    task_init();
+    wm_init();
+
+    (void)terminal_spawn();
+
+    // Main WM + cooperative scheduler loop.
+    for (;;) {
+        wm_pump_input();
+
+        char launch[32];
+        if (wm_consume_launch_request(launch, sizeof(launch))) {
+            (void)launcher_launch_gui(launch);
+        }
+
+        wm_reap_closed_windows();
+        wm_compose_if_dirty();
+        task_schedule_once();
+    }
 }

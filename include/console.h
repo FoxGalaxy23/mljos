@@ -27,6 +27,11 @@ extern struct framebuffer fb;
 extern struct framebuffer fb_root;
 
 void console_init(uint32_t *addr, uint32_t w, uint32_t h, uint32_t p);
+// Binds console rendering to an arbitrary framebuffer (e.g. a window backbuffer).
+// This does NOT change `fb_root` (physical screen); only the console target changes.
+void console_bind_target(uint32_t *addr, uint32_t w, uint32_t h, uint32_t pitch);
+// Re-binds console rendering back to the physical screen (`fb_root`).
+void console_bind_screen(void);
 // Настраивает активный viewport консоли (в пикселях относительно fb_root).
 // Параметры размера будут округлены вниз до кратности CHAR_WIDTH/CHAR_HEIGHT.
 void console_set_viewport(uint32_t origin_x_px, uint32_t origin_y_px, uint32_t w_px, uint32_t h_px);

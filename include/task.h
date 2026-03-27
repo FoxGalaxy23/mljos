@@ -1,0 +1,66 @@
+#ifndef TASK_H
+#define TASK_H
+
+#include "common.h"
+#include "sdk/mljos_api.h"
+
+typedef enum {
+    TASK_UNUSED = 0,
+    TASK_RUNNABLE = 1,
+    TASK_DEAD = 2,
+} task_state_t;
+
+typedef struct task_context {
+    uint64_t rsp;
+    uint64_t rbx;
+    uint64_t rbp;
+    uint64_t r12;
+    uint64_t r13;
+    uint64_t r14;
+    uint64_t r15;
+    uint64_t rip;
+    uint64_t cr3;
+} task_context_t;
+
+struct wm_window;
+
+typedef void (*task_entry_t)(void *arg);
+
+typedef struct task {
+    task_state_t state;
+    const char *name;
+    task_context_t ctx;
+    task_entry_t entry;
+    void *arg;
+    struct wm_window *window; // owned UI window (may be NULL)
+    mljos_api_t api;
+    uint8_t killed;
+} task_t;
+
+void task_init(void);
+
+task_t *task_current(void);
+mljos_api_t *task_current_api(void);
+
+// Creates a kernel-mode task with its own stack and address space (separate CR3),
+// but not loaded from an app image.
+task_t *task_create_kernel(const char *name, task_entry_t entry, void *arg);
+
+// Creates a task backed by a raw .app image that must be linked for MLJOS_APP_VADDR.
+task_t *task_create_app(const char *name, const void *image, uint32_t image_size);
+
+void task_attach_window(task_t *t, struct wm_window *w);
+
+// Called by tasks to cooperatively yield back to the kernel scheduler.
+void task_yield(void);
+
+// Marks current task dead and yields (never returns).
+__attribute__((noreturn)) void task_exit(void);
+
+// Run one scheduling quantum (switches into one runnable task).
+void task_schedule_once(void);
+
+// Ask a task to exit when it next yields.
+void task_kill(task_t *t);
+
+#endif

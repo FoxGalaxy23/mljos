@@ -1,4 +1,5 @@
 #include "disk.h"
+#include "app_layout.h"
 #include "console.h"
 #include "io.h"
 #include "kstring.h"
@@ -2467,7 +2468,7 @@ void cmd_disk_exec(const char *path) {
         return;
     }
 
-    char *app_start = (char *)0x800000;
+    char *app_start = (char *)(uintptr_t)MLJOS_APP_VADDR;
     uint32_t offset = 0;
 
     while (remaining > 0 && file_cluster >= 2) {

@@ -1,11 +1,15 @@
 #include "console.h"
 #include "font.h"
+#include "wm.h"
 
 struct framebuffer fb_root;
 struct framebuffer fb;
 uint32_t COLOR = COLOR_DEFAULT;
 int cursor_row = 0;
 int cursor_col = 0;
+
+// Active console render target root (may be different from physical screen fb_root).
+static struct framebuffer g_target_root;
 
 static const int CHAR_WIDTH = 8;
 static const int CHAR_HEIGHT = 16;
@@ -95,13 +99,43 @@ void console_init(uint32_t *addr, uint32_t w, uint32_t h, uint32_t p) {
     fb_root.height = rows * CHAR_HEIGHT;
 
     // В начале viewport == весь экран.
-    fb = fb_root;
+    g_target_root = fb_root;
+    fb = g_target_root;
     g_visible = 1;
     g_cols = cols;
     g_rows = rows;
 
     buffer_clear_all_cells(g_rows, g_cols);
     clear_screen();
+}
+
+void console_bind_target(uint32_t *addr, uint32_t w, uint32_t h, uint32_t pitch) {
+    if (!addr || w == 0 || h == 0 || pitch == 0) return;
+
+    // Round down to character grid.
+    uint32_t cols = clamp_cells_cols(w / CHAR_WIDTH);
+    uint32_t rows = clamp_cells_rows(h / CHAR_HEIGHT);
+    if (cols == 0) cols = 1;
+    if (rows == 0) rows = 1;
+
+    g_target_root.address = addr;
+    g_target_root.pitch = pitch;
+    g_target_root.width = cols * CHAR_WIDTH;
+    g_target_root.height = rows * CHAR_HEIGHT;
+
+    fb = g_target_root;
+    buffer_resize_preserve(rows, cols);
+
+    if ((uint32_t)cursor_row >= g_rows) cursor_row = (int)g_rows - 1;
+    if ((uint32_t)cursor_col >= g_cols) cursor_col = (int)g_cols - 1;
+}
+
+void console_bind_screen(void) {
+    g_target_root = fb_root;
+    fb = g_target_root;
+    buffer_resize_preserve(clamp_cells_rows(fb.height / CHAR_HEIGHT), clamp_cells_cols(fb.width / CHAR_WIDTH));
+    if ((uint32_t)cursor_row >= g_rows) cursor_row = (int)g_rows - 1;
+    if ((uint32_t)cursor_col >= g_cols) cursor_col = (int)g_cols - 1;
 }
 
 void clear_screen(void) {
@@ -118,6 +152,7 @@ void clear_screen(void) {
         uint32_t *row = (uint32_t*)((uintptr_t)fb.address + y * fb.pitch);
         for (uint32_t x = 0; x < fb.width; ++x) row[x] = 0;
     }
+    wm_mark_dirty();
 }
 
 void scroll_if_needed(void) {
@@ -149,6 +184,7 @@ void scroll_if_needed(void) {
     }
 
     cursor_row = (int)max_rows - 1;
+    wm_mark_dirty();
 }
 
 void putchar_at(char ch, int row, int col) {
@@ -160,6 +196,7 @@ void putchar_at(char ch, int row, int col) {
 
     if (!g_visible) return;
     draw_char(ch == 0 ? ' ' : ch, col * CHAR_WIDTH, row * CHAR_HEIGHT, COLOR);
+    wm_mark_dirty();
 }
 
 void putchar(char ch) {
@@ -197,7 +234,7 @@ void puts(const char *s) {
 }
 
 void console_set_viewport(uint32_t origin_x_px, uint32_t origin_y_px, uint32_t w_px, uint32_t h_px) {
-    if (!fb_root.address) return;
+    if (!g_target_root.address) return;
 
     // Приводим к границе символа.
     origin_x_px = (origin_x_px / CHAR_WIDTH) * CHAR_WIDTH;
@@ -213,10 +250,10 @@ void console_set_viewport(uint32_t origin_x_px, uint32_t origin_y_px, uint32_t w
     uint32_t old_rows = g_rows;
     uint32_t old_cols = g_cols;
 
-    fb.address = (uint32_t*)((uintptr_t)fb_root.address + origin_y_px * fb_root.pitch + origin_x_px * 4);
+    fb.address = (uint32_t*)((uintptr_t)g_target_root.address + origin_y_px * g_target_root.pitch + origin_x_px * 4);
     fb.width = new_cols * CHAR_WIDTH;
     fb.height = new_rows * CHAR_HEIGHT;
-    fb.pitch = fb_root.pitch;
+    fb.pitch = g_target_root.pitch;
 
     buffer_resize_preserve(new_rows, new_cols);
 
@@ -257,6 +294,7 @@ void console_redraw(void) {
             draw_char((char)ch, c * CHAR_WIDTH, r * CHAR_HEIGHT, g_cell_color[r][c]);
         }
     }
+    wm_mark_dirty();
 }
 
 void update_cursor(void) {
