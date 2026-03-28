@@ -24,6 +24,10 @@
 #include "apps/date_app.h"
 #include "apps/terminal_app.h"
 #include "boot/limine_bootx64_efi.h"
+#include "assets/wallpaper_bmp.h"
+#include "assets/icon_calc_bmp.h"
+#include "assets/icon_terminal_bmp.h"
+#include "assets/icon_time_bmp.h"
 #include "common.h"
 
 extern uint8_t _kernel_start[];
@@ -525,6 +529,35 @@ void fs_init(void) {
 
     fs_node_t *terminal = fs_create_node(apps_dir ? apps_dir : fs_root, "terminal.app", FS_FILE, 0, 0, 0755);
     if (terminal) { terminal->size = terminal_app_size; terminal->content = (char*)terminal_app_data; }
+
+    // Wallpaper
+    if (wallpaper_bmp_size > 0) {
+        fs_node_t *wp = fs_create_node(fs_root, "wallpaper.bmp", FS_FILE, 0, 0, 0644);
+        if (wp) { wp->size = wallpaper_bmp_size; wp->content = (char*)wallpaper_bmp_data; }
+    }
+
+    // App icons
+    {
+        fs_node_t *icons_dir = NULL;
+        if (apps_dir) {
+            icons_dir = fs_find_child(apps_dir, "icons");
+            if (!icons_dir) icons_dir = fs_create_node(apps_dir, "icons", FS_DIR, 0, 0, 0755);
+        }
+        if (icons_dir) {
+            if (icon_calc_bmp_size > 0) {
+                fs_node_t *n = fs_create_node(icons_dir, "calc.bmp", FS_FILE, 0, 0, 0644);
+                if (n) { n->size = icon_calc_bmp_size; n->content = (char*)icon_calc_bmp_data; }
+            }
+            if (icon_terminal_bmp_size > 0) {
+                fs_node_t *n = fs_create_node(icons_dir, "terminal.bmp", FS_FILE, 0, 0, 0644);
+                if (n) { n->size = icon_terminal_bmp_size; n->content = (char*)icon_terminal_bmp_data; }
+            }
+            if (icon_time_bmp_size > 0) {
+                fs_node_t *n = fs_create_node(icons_dir, "time.bmp", FS_FILE, 0, 0, 0644);
+                if (n) { n->size = icon_time_bmp_size; n->content = (char*)icon_time_bmp_data; }
+            }
+        }
+    }
 
     // UEFI shell fallback: auto-launch default bootloader path.
     fs_node_t *startup = fs_create_node(fs_root, "startup.nsh", FS_FILE, 0, 0, 0644);

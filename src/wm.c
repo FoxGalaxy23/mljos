@@ -1,13 +1,17 @@
 #include "wm.h"
 
 #include "apps_registry.h"
+#include "bmp.h"
 #include "console.h"
+#include "disk.h"
 #include "font.h"
+#include "fs.h"
 #include "io.h"
 #include "kmem.h"
 #include "kstring.h"
 #include "rtc.h"
 #include "task.h"
+#include "users.h"
 
 #define WM_MAX_WINDOWS 16
 #define WM_MAX_EVENTS 64
@@ -198,8 +202,24 @@ static int g_resize_edges = 0; // bitmask: 1 left,2 right,4 top,8 bottom
 static uint32_t *g_backbuf = NULL;
 static uint32_t g_back_pitch = 0;
 
+// Desktop wallpaper (scaled to screen, 0x00RRGGBB)
+static uint32_t *g_wallpaper = NULL;
+static int g_wallpaper_w = 0;
+static int g_wallpaper_h = 0;
+
+#define WM_ICON_CACHE_MAX 64
+typedef struct wm_icon_entry {
+    char name[32];
+    uint8_t loaded;
+    uint32_t *px16; // 16x16, 0x00RRGGBB
+} wm_icon_entry_t;
+
+static wm_icon_entry_t g_icon_cache[WM_ICON_CACHE_MAX];
+
 static uint32_t screen_w(void) { return fb_root.width; }
 static uint32_t screen_h(void) { return fb_root.height; }
+
+static uint32_t *wm_get_app_icon16(const char *app_name);
 
 static int rect_contains(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && y >= ry && x < rx + rw && y < ry + rh;
@@ -242,6 +262,31 @@ static void draw_text(uint32_t *dst, uint32_t pitch, int dst_w, int dst_h, const
         draw_char(dst, pitch, dst_w, dst_h, s[i], xx, y, rgb);
         xx += 8;
         if (xx + 8 > dst_w) break;
+    }
+}
+
+static void blit_rgb32(uint32_t *dst, uint32_t pitch, int dst_w, int dst_h,
+    int x, int y, const uint32_t *src, int src_w, int src_h) {
+    if (!dst || !src || src_w <= 0 || src_h <= 0) return;
+
+    int x0 = x;
+    int y0 = y;
+    int x1 = x + src_w;
+    int y1 = y + src_h;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > dst_w) x1 = dst_w;
+    if (y1 > dst_h) y1 = dst_h;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    for (int yy = y0; yy < y1; ++yy) {
+        int sy = yy - y;
+        const uint32_t *src_row = src + (uint64_t)sy * (uint64_t)src_w;
+        uint32_t *dst_row = (uint32_t *)((uintptr_t)dst + (uintptr_t)yy * pitch);
+        for (int xx = x0; xx < x1; ++xx) {
+            int sx = xx - x;
+            dst_row[xx] = src_row[sx];
+        }
     }
 }
 
@@ -474,7 +519,9 @@ static void draw_start_menu(uint32_t *dst, uint32_t pitch, int sw, int sh) {
     const mljos_app_descriptor_t *apps = apps_registry_list(&count);
     for (int i = 0; i < count; ++i) {
         if (!apps[i].supports_ui) continue;
-        draw_text(dst, pitch, sw, sh, apps[i].title ? apps[i].title : apps[i].name, x0 + 10, y, 0xFFFFFF);
+        uint32_t *icon = wm_get_app_icon16(apps[i].name);
+        if (icon) blit_rgb32(dst, pitch, sw, sh, x0 + 10, y - 1, icon, 16, 16);
+        draw_text(dst, pitch, sw, sh, apps[i].title ? apps[i].title : apps[i].name, x0 + (icon ? 30 : 10), y, 0xFFFFFF);
         y += 22;
         if (y > y0 + menu_h - 24) break;
     }
@@ -501,8 +548,126 @@ void wm_mark_dirty(void) {
     g_dirty = 1;
 }
 
+static int load_file_anywhere(const char *path, void **out_buf, uint32_t *out_size, uint32_t maxlen) {
+    if (!path || !out_buf || !out_size || maxlen == 0) return 0;
+
+    char *buf = (char *)kmem_alloc((uint64_t)maxlen, 16);
+    if (!buf) return 0;
+
+    uint32_t size = 0;
+    int ok = 0;
+
+    if (users_system_is_installed()) {
+        ok = disk_read_file(path, buf, (int)maxlen, &size);
+        if (!ok) ok = fs_read_file(path, buf, (int)maxlen, &size);
+    } else {
+        ok = fs_read_file(path, buf, (int)maxlen, &size);
+        if (!ok) ok = disk_read_file(path, buf, (int)maxlen, &size);
+    }
+
+    if (!ok || size == 0) return 0;
+    *out_buf = buf;
+    *out_size = size;
+    return 1;
+}
+
+static void wm_try_load_wallpaper(void) {
+    if (!screen_w() || !screen_h()) return;
+    if (g_wallpaper) return;
+
+    void *file = NULL;
+    uint32_t file_size = 0;
+    if (!load_file_anywhere("/wallpaper.bmp", &file, &file_size, 16u * 1024u * 1024u)) return;
+
+    uint32_t *px = NULL;
+    int w = 0;
+    int h = 0;
+    if (!bmp_decode_rgb32(file, file_size, &px, &w, &h)) return;
+    if (w <= 0 || h <= 0) return;
+
+    // Scale once to screen size (nearest neighbor).
+    uint32_t *scaled = NULL;
+    if (w == (int)screen_w() && h == (int)screen_h()) {
+        scaled = px;
+    } else {
+        if (!bmp_scale_nearest_rgb32(px, w, h, &scaled, (int)screen_w(), (int)screen_h())) return;
+    }
+
+    g_wallpaper = scaled;
+    g_wallpaper_w = (int)screen_w();
+    g_wallpaper_h = (int)screen_h();
+}
+
+static wm_icon_entry_t *icon_cache_find_or_alloc(const char *name) {
+    if (!name || !name[0]) return NULL;
+
+    for (int i = 0; i < WM_ICON_CACHE_MAX; ++i) {
+        if (g_icon_cache[i].loaded && g_icon_cache[i].name[0] && strcmp(g_icon_cache[i].name, name) == 0) return &g_icon_cache[i];
+    }
+    for (int i = 0; i < WM_ICON_CACHE_MAX; ++i) {
+        if (!g_icon_cache[i].loaded && !g_icon_cache[i].name[0]) {
+            strncpy(g_icon_cache[i].name, name, sizeof(g_icon_cache[i].name) - 1);
+            g_icon_cache[i].name[sizeof(g_icon_cache[i].name) - 1] = '\0';
+            return &g_icon_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static int build_icon_path(char *out, int out_size, const char *prefix, const char *name) {
+    if (!out || out_size < 8 || !prefix || !name) return 0;
+    int pos = 0;
+    for (int i = 0; prefix[i] && pos < out_size - 1; ++i) out[pos++] = prefix[i];
+    for (int i = 0; name[i] && pos < out_size - 1; ++i) out[pos++] = name[i];
+    const char *suf = ".bmp";
+    for (int i = 0; suf[i] && pos < out_size - 1; ++i) out[pos++] = suf[i];
+    out[pos] = '\0';
+    return pos > 0;
+}
+
+static uint32_t *wm_get_app_icon16(const char *app_name) {
+    wm_icon_entry_t *e = icon_cache_find_or_alloc(app_name);
+    if (!e) return NULL;
+    if (e->loaded) return e->px16;
+
+    e->loaded = 1; // mark as attempted
+    e->px16 = NULL;
+
+    const char *prefixes[] = {
+        "/apps/icons/",
+        "/apps/",
+        "/icons/",
+    };
+
+    for (unsigned int i = 0; i < (unsigned int)(sizeof(prefixes) / sizeof(prefixes[0])); ++i) {
+        char path[128];
+        if (!build_icon_path(path, (int)sizeof(path), prefixes[i], app_name)) continue;
+
+        void *file = NULL;
+        uint32_t file_size = 0;
+        if (!load_file_anywhere(path, &file, &file_size, 512u * 1024u)) continue;
+
+        uint32_t *px = NULL;
+        int w = 0;
+        int h = 0;
+        if (!bmp_decode_rgb32(file, file_size, &px, &w, &h)) continue;
+
+        uint32_t *scaled = NULL;
+        if (w == 16 && h == 16) scaled = px;
+        else {
+            if (!bmp_scale_nearest_rgb32(px, w, h, &scaled, 16, 16)) continue;
+        }
+
+        e->px16 = scaled;
+        return e->px16;
+    }
+
+    return NULL;
+}
+
 void wm_init(void) {
     kmem_memset(g_windows, 0, sizeof(g_windows));
+    kmem_memset(g_icon_cache, 0, sizeof(g_icon_cache));
     g_zcount = 0;
     g_next_id = 1;
     g_focused = NULL;
@@ -524,6 +689,7 @@ void wm_init(void) {
         g_back_pitch = (uint32_t)(screen_w() * 4);
         kmem_memset(g_backbuf, 0, bytes);
     }
+
 }
 
 wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_px) {
@@ -1002,12 +1168,22 @@ void wm_compose_if_dirty(void) {
     if (!g_dirty) return;
     if (!fb_root.address) return;
 
+    wm_try_load_wallpaper();
+
     uint32_t *dst = g_backbuf ? g_backbuf : fb_root.address;
     uint32_t pitch = g_backbuf ? g_back_pitch : fb_root.pitch;
     int sw = (int)screen_w();
     int sh = (int)screen_h();
 
-    fill_rect(dst, pitch, sw, sh, 0, 0, sw, sh, COL_DESKTOP);
+    if (g_wallpaper && g_wallpaper_w == sw && g_wallpaper_h == sh) {
+        for (int y = 0; y < sh; ++y) {
+            uint32_t *src_row = g_wallpaper + (uint64_t)y * (uint64_t)sw;
+            uint32_t *dst_row = (uint32_t *)((uintptr_t)dst + (uintptr_t)y * pitch);
+            for (int x = 0; x < sw; ++x) dst_row[x] = src_row[x];
+        }
+    } else {
+        fill_rect(dst, pitch, sw, sh, 0, 0, sw, sh, COL_DESKTOP);
+    }
 
     // Windows bottom->top
     for (int i = 0; i < g_zcount; ++i) {

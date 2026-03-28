@@ -51,7 +51,7 @@ fi
 # 3. Проверяем, что файл существует (должно быть около 232k)
 ls -lh limine/BOOTX64.EFI || true
 
-mkdir -p "$OBJ_DIR" "$APP_BUILD_DIR" "$GENERATED_INCLUDE_DIR/apps" "$ISO_DIR/boot/grub"
+mkdir -p "$OBJ_DIR" "$APP_BUILD_DIR" "$GENERATED_INCLUDE_DIR/apps" "$GENERATED_INCLUDE_DIR/assets" "$ISO_DIR/boot/grub"
 cp "$ROOT_DIR/config/grub.cfg" "$ISO_DIR/boot/grub/grub.cfg"
 
 echo "Preparing bootloader payload headers..."
@@ -107,6 +107,49 @@ else
     echo "  - /usr/share/limine/BOOTX64.EFI"
     exit 1
 fi
+
+echo "Generating asset headers (wallpaper & icons)..."
+python3 -c "
+import pathlib
+import sys
+
+def write_header(header_path, symbol, data):
+    guard = header_path.name.replace('.', '_').upper()
+    with header_path.open('w') as f:
+        f.write(f'#ifndef {guard}\\n#define {guard}\\n\\n')
+        f.write(f'static const unsigned int {symbol}_size = {len(data)};\\n')
+        if data:
+            f.write(f'static const unsigned char {symbol}_data[] = {{\\n')
+            for i in range(0, len(data), 20):
+                chunk = data[i:i+20]
+                f.write('    ' + ', '.join(f'0x{b:02x}' for b in chunk) + ',\\n')
+            f.write('};\\n\\n')
+        else:
+            f.write(f'static const unsigned char {symbol}_data[] = {{0x00}};\\n\\n')
+        f.write('#endif\\n')
+
+assets_dir = pathlib.Path('$GENERATED_INCLUDE_DIR/assets')
+assets_dir.mkdir(parents=True, exist_ok=True)
+root = pathlib.Path('$ROOT_DIR')
+
+# Wallpaper
+wp = root / 'wallpaper.bmp'
+if wp.is_file():
+    write_header(assets_dir / 'wallpaper_bmp.h', 'wallpaper_bmp', wp.read_bytes())
+    print(f'  wallpaper: {wp.stat().st_size} bytes')
+else:
+    write_header(assets_dir / 'wallpaper_bmp.h', 'wallpaper_bmp', b'')
+    print('  wallpaper: not found, empty stub')
+
+# Icons
+icons_dir = root / 'apps' / 'icons'
+if icons_dir.is_dir():
+    for bmp in sorted(icons_dir.glob('*.bmp')):
+        sym = 'icon_' + bmp.stem + '_bmp'
+        hdr = assets_dir / (sym + '.h')
+        write_header(hdr, sym, bmp.read_bytes())
+        print(f'  icon {bmp.stem}: {bmp.stat().st_size} bytes')
+"
 
 echo "Building apps..."
 APP_ELFS=""
