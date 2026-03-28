@@ -1,12 +1,13 @@
 #include "launcher.h"
 
+#include "console.h"
 #include "disk.h"
 #include "fs.h"
 #include "kmem.h"
 #include "kstring.h"
 #include "rtc.h"
+#include "shell.h"
 #include "task.h"
-#include "terminal_app.h"
 #include "ui.h"
 #include "users.h"
 #include "wm.h"
@@ -54,10 +55,6 @@ static int load_app_image(const char *app_path, void **out_image, uint32_t *out_
 int launcher_launch_gui(const char *name) {
     if (!name || !name[0]) return 0;
 
-    if (strcmp(name, "terminal") == 0) {
-        return terminal_spawn();
-    }
-
     char app_path[128];
     if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) return 0;
 
@@ -74,7 +71,24 @@ int launcher_launch_gui(const char *name) {
         return 0;
     }
 
+    if (strcmp(name, "terminal") == 0) {
+        shell_init_task_api(t);
+    }
+
     fill_minimal_gui_api(&t->api);
+
+    if (strcmp(name, "terminal") == 0) {
+        console_t *c = console_create();
+        task_attach_console(t, c);
+        console_bind_target(c,
+            wm_window_client_pixels(w),
+            (uint32_t)wm_window_client_w(w),
+            (uint32_t)wm_window_client_h(w),
+            wm_window_client_pitch_bytes(w));
+        console_set_visible(c, 1);
+        console_redraw(c);
+    }
+
     task_attach_window(t, w);
     wm_window_set_owner(w, t);
     wm_window_focus(w);

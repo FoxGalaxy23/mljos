@@ -2,9 +2,12 @@
 #include "app_layout.h"
 #include "console.h"
 #include "io.h"
+#include "kmem.h"
 #include "kstring.h"
 #include "shell.h"
+#include "sdk/mljos_app.h"
 #include "sdk/mljos_api.h"
+#include "task.h"
 #include "usb.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
@@ -2244,6 +2247,45 @@ int disk_read_file(const char *path, char *out, int maxlen, uint32_t *size_out) 
     return 1;
 }
 
+int disk_read_file_prefix(const char *path, char *out, int maxlen, uint32_t *bytes_read_out) {
+    fat32_lookup_result_t entry;
+    uint32_t file_cluster;
+    uint32_t remaining;
+    uint8_t cluster_buffer[4096];
+    uint32_t cluster_bytes;
+    char resolved_path[128];
+    int offset = 0;
+
+    if (bytes_read_out) *bytes_read_out = 0;
+    g_disk_io_error = 0;
+    if (!out || maxlen <= 0) return 0;
+    if (!fat32_mount()) return 0;
+    if (!fat32_normalize_path(path, resolved_path) || strcmp(resolved_path, "/") == 0) return 0;
+    if (!fat32_resolve_path(resolved_path, NULL, &entry)) return 0;
+    if (entry.entry.attr & FAT32_ATTR_DIRECTORY) return 0;
+
+    file_cluster = fat32_dir_first_cluster(&entry.entry);
+    remaining = entry.entry.file_size;
+    cluster_bytes = (uint32_t)g_fat32.sectors_per_cluster * 512U;
+    if (cluster_bytes > sizeof(cluster_buffer)) return 0;
+
+    while (remaining > 0 && file_cluster >= 2 && offset < maxlen) {
+        fat32_read_cluster(file_cluster, cluster_buffer);
+        if (g_disk_io_error) return 0;
+
+        uint32_t chunk = remaining > cluster_bytes ? cluster_bytes : remaining;
+        for (uint32_t i = 0; i < chunk && offset < maxlen; i++) out[offset++] = (char)cluster_buffer[i];
+        remaining -= chunk;
+
+        if (remaining == 0) break;
+        file_cluster = fat32_read_fat_entry(file_cluster);
+        if (is_fat32_eoc(file_cluster)) break;
+    }
+
+    if (bytes_read_out) *bytes_read_out = (uint32_t)offset;
+    return 1;
+}
+
 int disk_load_user_config(char *out, int maxlen) {
     g_disk_io_error = 0;
     if (!fat32_mount()) return 0;
@@ -2467,8 +2509,13 @@ void cmd_disk_exec(const char *path) {
         puts("exec: file is empty\n");
         return;
     }
+    if (remaining > (uint32_t)MLJOS_APP_REGION_SIZE) {
+        puts("exec: app image too large\n");
+        return;
+    }
 
     char *app_start = (char *)(uintptr_t)MLJOS_APP_VADDR;
+    kmem_memset(app_start, 0, (uint64_t)MLJOS_APP_REGION_SIZE);
     uint32_t offset = 0;
 
     while (remaining > 0 && file_cluster >= 2) {
@@ -2478,7 +2525,7 @@ void cmd_disk_exec(const char *path) {
             return;
         }
         uint32_t chunk = remaining > cluster_bytes ? cluster_bytes : remaining;
-        for (uint32_t i = 0; i < chunk; i++) {
+        for (uint32_t i = 0; i < chunk && offset < (uint32_t)MLJOS_APP_REGION_SIZE; i++) {
             app_start[offset++] = (char)cluster_buffer[i];
         }
         remaining -= chunk;
@@ -2492,8 +2539,11 @@ void cmd_disk_exec(const char *path) {
         return;
     }
 
-    app_entry_t app = (app_entry_t)app_start;
-    app(&os_api);
+    uint32_t off = mljos_app_entry_offset_from_image(app_start, offset);
+    app_entry_t app = (app_entry_t)(app_start + off);
+    mljos_api_t *api = task_current_api();
+    if (!api || !api->puts) api = &os_api;
+    app(api);
 }
 
 int disk_can_exec_path(const char *path) {

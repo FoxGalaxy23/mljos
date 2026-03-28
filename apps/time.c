@@ -1,6 +1,9 @@
 #include "sdk/mljos_api.h"
+#include "sdk/mljos_app.h"
 
-void _start(mljos_api_t *api) {
+MLJOS_APP_DEFINE("Time", MLJOS_APP_FLAG_TUI | MLJOS_APP_FLAG_GUI);
+
+MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     if (api && (api->launch_flags & MLJOS_LAUNCH_GUI) && api->ui) {
         api->ui->begin_app("Time");
 

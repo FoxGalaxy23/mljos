@@ -5,8 +5,11 @@
  */
 
 #include "sdk/mljos_api.h"
+#include "sdk/mljos_app.h"
 
-void _start(mljos_api_t *api);
+MLJOS_APP_DEFINE("MC Runner", MLJOS_APP_FLAG_TUI);
+
+MLJOS_APP_ENTRY void _start(mljos_api_t *api);
 
 #ifndef NULL
 #define NULL ((void*)0)
@@ -22,7 +25,7 @@ enum {
 
 typedef signed char code;
 
-void _start(mljos_api_t *api) {
+MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     // The runner logic:
     // 1. In mljOS, apps are loaded at 0x800000.
     // 2. This runner binary has a certain size (RUNNER_SIZE).

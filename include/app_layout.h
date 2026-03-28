@@ -8,6 +8,6 @@
 // allocations can grow into that range and would get shadowed by the per-task
 // app mapping.
 #define MLJOS_APP_VADDR 0x40000000ULL
+#define MLJOS_APP_REGION_SIZE (2 * 1024 * 1024ULL)
 
 #endif
-

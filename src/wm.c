@@ -68,7 +68,6 @@ static int g_zcount = 0;
 static int g_next_id = 1;
 
 static wm_window_t *g_focused = NULL;
-static wm_window_t *g_terminal = NULL;
 
 static int g_dirty = 1;
 static int g_start_open = 0;
@@ -285,12 +284,12 @@ static void win_ensure_backbuffer(wm_window_t *w) {
     }
 }
 
-static void terminal_rebind_if_needed(wm_window_t *w) {
+static void console_rebind_if_needed(wm_window_t *w) {
     if (!w) return;
-    if (w != g_terminal) return;
     if (!w->client_px) return;
-    console_bind_target(w->client_px, (uint32_t)w->client_w, (uint32_t)w->client_h, w->client_pitch);
-    console_redraw();
+    if (!w->owner || !w->owner->console) return;
+    console_bind_target(w->owner->console, w->client_px, (uint32_t)w->client_w, (uint32_t)w->client_h, w->client_pitch);
+    console_redraw(w->owner->console);
     wm_mark_dirty();
 }
 
@@ -471,9 +470,6 @@ static void draw_start_menu(uint32_t *dst, uint32_t pitch, int sw, int sh) {
     fill_rect(dst, pitch, sw, sh, x0, y0 + menu_h - 2, menu_w, 2, COL_WIN_BORDER);
 
     int y = y0 + 10;
-    draw_text(dst, pitch, sw, sh, "Terminal", x0 + 10, y, 0xFFFFFF);
-    y += 22;
-
     int count = 0;
     const mljos_app_descriptor_t *apps = apps_registry_list(&count);
     for (int i = 0; i < count; ++i) {
@@ -510,7 +506,6 @@ void wm_init(void) {
     g_zcount = 0;
     g_next_id = 1;
     g_focused = NULL;
-    g_terminal = NULL;
     g_start_open = 0;
     g_has_launch_req = 0;
     g_drag_mode = DRAG_NONE;
@@ -530,9 +525,6 @@ void wm_init(void) {
         kmem_memset(g_backbuf, 0, bytes);
     }
 }
-
-wm_window_t *wm_terminal_window(void) { return g_terminal; }
-void wm_set_terminal_window(wm_window_t *w) { g_terminal = w; }
 
 wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_px) {
     int slot = -1;
@@ -585,7 +577,6 @@ void wm_window_destroy(wm_window_t *w) {
     if (!w) return;
     w->used = 0;
     if (g_focused == w) g_focused = NULL;
-    if (g_terminal == w) g_terminal = NULL;
     z_rebuild();
     wm_mark_dirty();
 }
@@ -777,7 +768,7 @@ static void win_toggle_maximize(wm_window_t *w) {
     }
     win_recompute_client(w);
     win_ensure_backbuffer(w);
-    terminal_rebind_if_needed(w);
+    console_rebind_if_needed(w);
     win_post_expose(w);
     wm_mark_dirty();
 }
@@ -804,6 +795,7 @@ static void handle_click_taskbar(int x, int y) {
     int start_w = 70;
     if (rect_contains(x, y, 6, y0 + 4, start_w, TASKBAR_PX - 8)) {
         g_start_open = !g_start_open;
+        if (g_start_open) apps_registry_refresh();
         wm_mark_dirty();
         return;
     }
@@ -838,16 +830,6 @@ static void handle_click_start_menu(int x, int y) {
     }
 
     int yy = y0 + 10;
-    if (rect_contains(x, y, x0 + 6, yy - 2, menu_w - 12, 18)) {
-        g_start_open = 0;
-        wm_mark_dirty();
-        // Terminal: focus existing if present, else request launch.
-        if (g_terminal && g_terminal->used) wm_window_focus(g_terminal);
-        else set_launch_req("terminal");
-        return;
-    }
-    yy += 22;
-
     int count = 0;
     const mljos_app_descriptor_t *apps = apps_registry_list(&count);
     for (int i = 0; i < count; ++i) {
@@ -990,7 +972,7 @@ static void handle_mouse_move(void) {
         w->x = nx; w->y = ny; w->w = nw; w->h = nh;
         win_recompute_client(w);
         win_ensure_backbuffer(w);
-        terminal_rebind_if_needed(w);
+        console_rebind_if_needed(w);
         win_post_expose(w);
         wm_mark_dirty();
         return;

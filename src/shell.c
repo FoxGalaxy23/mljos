@@ -12,6 +12,7 @@
 #include "usb.h"
 #include "users.h"
 #include "wm.h"
+#include "sdk/mljos_app.h"
 
 static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out);
 static int app_write_file(const char *path, const char *buf, unsigned int size);
@@ -35,13 +36,41 @@ typedef enum shell_location {
     SHELL_STORAGE = 1
 } shell_location_t;
 
-static storage_target_t active_storage = STORAGE_RAM;
-static shell_location_t shell_location = SHELL_STORAGE;
-
 static int shell_disk_primary_mode(void);
 
-// Used to pass an optional file path to apps (e.g., `edit <path>`).
-static char g_edit_open_path[128];
+static storage_target_t g_kernel_active_storage = STORAGE_RAM;
+static shell_location_t g_kernel_shell_location = SHELL_STORAGE;
+static uint32_t g_kernel_launch_flags = 0;
+static char g_kernel_open_path[128];
+
+static storage_target_t *active_storage_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return &g_kernel_active_storage;
+    return (storage_target_t *)&t->shell_active_storage;
+}
+
+static shell_location_t *shell_location_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return &g_kernel_shell_location;
+    return (shell_location_t *)&t->shell_location;
+}
+
+static uint32_t *launch_flags_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return &g_kernel_launch_flags;
+    return &t->shell_launch_flags;
+}
+
+static char *open_path_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return g_kernel_open_path;
+    return t->shell_open_path;
+}
+
+#define SHELL_OPEN_PATH_MAX 128
+#define active_storage (*active_storage_ptr())
+#define shell_location (*shell_location_ptr())
+#define g_launch_flags (*launch_flags_ptr())
 
 mljos_api_t os_api = {
     .puts = puts,
@@ -59,17 +88,65 @@ mljos_api_t os_api = {
     .rm = os_rm,
     .get_time = os_get_time,
     .get_date = os_get_date,
-    .open_path = g_edit_open_path,
+    .open_path = g_kernel_open_path,
+    .run_shell = shell_run,
     .launch_flags = 0,
     .ui = NULL,
 };
 
 #define HISTORY_SIZE 16
 
-static uint32_t g_launch_flags = 0;
+static void *g_kernel_shell_jmp_env[8];
+static int g_kernel_jmp_ready = 0;
+static int g_shell_booted = 0;
 
-static void *g_shell_jmp_env[8];
-static int g_jmp_ready = 0;
+static void **shell_jmp_env_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return g_kernel_shell_jmp_env;
+    return t->shell_jmp_env;
+}
+
+static int *shell_jmp_ready_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return &g_kernel_jmp_ready;
+    return &t->shell_jmp_ready;
+}
+
+static char (*shell_history_ptr(void))[128] {
+    task_t *t = task_current();
+    if (!t) return NULL;
+    return t->shell_history;
+}
+
+static int *shell_history_count_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return NULL;
+    return &t->shell_history_count;
+}
+
+static int *shell_history_pos_ptr(void) {
+    task_t *t = task_current();
+    if (!t) return NULL;
+    return &t->shell_history_pos;
+}
+
+void shell_boot(void) {
+    if (g_shell_booted) return;
+    g_shell_booted = 1;
+    os_api.ui = ui_api();
+    users_init();
+    (void)users_load_from_disk();
+    fs_init();
+    users_bootstrap_fs();
+}
+
+void shell_init_task_api(task_t *t) {
+    if (!t) return;
+    t->api = os_api;
+    t->api.open_path = t->shell_open_path;
+    t->api.launch_flags = 0;
+    t->api.ui = NULL;
+}
 
 static void os_set_cursor(int row, int col) {
     cursor_row = row;
@@ -89,7 +166,7 @@ static int os_read_key(void) {
             mljos_ui_event_t ev;
             while (wm_window_poll_event(t->window, &ev)) {
                 if (ev.type != MLJOS_UI_EVENT_KEY_DOWN) continue;
-                if (ev.key == 3 && g_jmp_ready) __builtin_longjmp(g_shell_jmp_env, 1); // Ctrl+C
+                if (ev.key == 3 && *shell_jmp_ready_ptr()) __builtin_longjmp(shell_jmp_env_ptr(), 1); // Ctrl+C
                 return ev.key;
             }
         }
@@ -174,11 +251,7 @@ static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y) {
     get_rtc_date(d, mo, y);
 }
 
-static char history[HISTORY_SIZE][128];
-static int history_count = 0;
-static int history_pos = -1;
-
-// Old storage definitions removed
+// Shell history is per-task; stored in task_t fields.
 
 static void handle_command(char *line);
 static int shell_disk_primary_mode(void);
@@ -257,12 +330,12 @@ static void cmd_echo(const char *rest) {
         if (rest) {
             int i = 0;
             while (rest[i] && i < 127) {
-                g_edit_open_path[i] = rest[i];
+                open_path_ptr()[i] = rest[i];
                 i++;
             }
-            g_edit_open_path[i] = '\0';
+            open_path_ptr()[i] = '\0';
         } else {
-            g_edit_open_path[0] = '\0';
+            open_path_ptr()[0] = '\0';
         }
         shell_exec_app_command("echo");
     }
@@ -294,22 +367,29 @@ static void cmd_shutdown(void) {
 static void push_history(const char *line) {
     if (!line || !line[0]) return;
 
-    int idx = history_count % HISTORY_SIZE;
+    char (*history)[128] = shell_history_ptr();
+    int *history_count = shell_history_count_ptr();
+    if (!history || !history_count) return;
+
+    int idx = (*history_count) % HISTORY_SIZE;
     int i;
     for (i = 0; i < 127 && line[i]; ++i) history[idx][i] = line[i];
     history[idx][i] = '\0';
-    history_count++;
+    (*history_count)++;
 }
 
 static const char *history_get(int pos_from_latest) {
-    if (history_count == 0 || pos_from_latest < 0) return NULL;
+    char (*history)[128] = shell_history_ptr();
+    int *history_count = shell_history_count_ptr();
+    if (!history || !history_count) return NULL;
+    if (*history_count == 0 || pos_from_latest < 0) return NULL;
 
     {
-        int avail = history_count < HISTORY_SIZE ? history_count : HISTORY_SIZE;
+        int avail = *history_count < HISTORY_SIZE ? *history_count : HISTORY_SIZE;
         int idx;
         if (pos_from_latest >= avail) return NULL;
 
-        idx = (history_count - 1 - pos_from_latest) % HISTORY_SIZE;
+        idx = (*history_count - 1 - pos_from_latest) % HISTORY_SIZE;
         if (idx < 0) idx += HISTORY_SIZE;
         return history[idx];
     }
@@ -327,8 +407,10 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
     int prompt_row = cursor_row;
     int prompt_col = cursor_col;
     uint8_t old_color = COLOR;
+    int *history_count = shell_history_count_ptr();
+    int *history_pos = shell_history_pos_ptr();
 
-    history_pos = -1;
+    if (history_pos) *history_pos = -1;
     COLOR = COLOR_DEFAULT;
     update_cursor();
 
@@ -338,10 +420,10 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
 
         // Special arrows (from WM key translation).
         if (c == 1000) { // Up
-            if (!allow_history || history_count == 0) continue;
-            if (history_pos < 0) history_pos = 0;
-            else if (history_pos < HISTORY_SIZE - 1) history_pos++;
-            const char *h = history_get(history_pos);
+            if (!allow_history || !history_count || !history_pos || *history_count == 0) continue;
+            if (*history_pos < 0) *history_pos = 0;
+            else if (*history_pos < HISTORY_SIZE - 1) (*history_pos)++;
+            const char *h = history_get(*history_pos);
             if (h) {
                 clear_input_visual(prompt_row, prompt_col);
                 int i = 0;
@@ -362,17 +444,17 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
             continue;
         }
         if (c == 1001) { // Down
-            if (!allow_history || history_count == 0) continue;
-            if (history_pos <= 0) {
-                history_pos = -1;
+            if (!allow_history || !history_count || !history_pos || *history_count == 0) continue;
+            if (*history_pos <= 0) {
+                *history_pos = -1;
                 clear_input_visual(prompt_row, prompt_col);
                 len = 0;
                 buf[0] = '\0';
                 update_cursor();
                 continue;
             }
-            history_pos--;
-            const char *h = history_get(history_pos);
+            (*history_pos)--;
+            const char *h = history_get(*history_pos);
             if (h) {
                 clear_input_visual(prompt_row, prompt_col);
                 int i = 0;
@@ -585,6 +667,7 @@ static void print_storage_help(void) {
     puts("Files: ls [path], cd <path>, pwd, mkdir <path>, mkdir -p <path>, rmdir <path>, touch <path>, rm <path>, cat <path>, write <path> <text>, cp <src> <dst>\n");
     puts("Disk: disk devices, disk use <n>, disk format, disk ls/cd/pwd/mkdir/write/cat/rm\n");
     puts("Apps: bundled apps are stored in /apps and can be launched by name, like calc or edit\n");
+    puts("Apps (GUI): `open <app>` launches the app in a window (if it supports GUI)\n");
     puts("Editor: `edit [path]` opens a file in the built-in editor\n");
     puts("System: install, exec <app|path>, usb, clear, help, shutdown, reboot\n");
     puts("Scripts: .scri in /system/autorun run on boot (run by typing file name)\n");
@@ -596,8 +679,9 @@ static int shell_try_launch_app_command(const char *name) {
 
     if (!name || !name[0]) return 0;
 
-    // GUI-capable apps run in their own windowed task and do not block the terminal.
-    if (apps_registry_supports_ui(name)) {
+    // Prefer TUI for hybrid apps; GUI-only apps run in their own windowed task.
+    uint32_t flags = apps_registry_app_flags(name);
+    if ((flags & MLJOS_APP_FLAG_GUI) && !(flags & MLJOS_APP_FLAG_TUI)) {
         return launcher_launch_gui(name);
     }
 
@@ -623,17 +707,19 @@ static int shell_try_launch_app_command(const char *name) {
 
 void shell_exec_app_command(const char *name) {
     char app_path[128];
-    uint32_t prev_flags = os_api.launch_flags;
-    os_api.launch_flags = g_launch_flags;
+    mljos_api_t *api = task_current_api();
+    if (!api || !api->puts) api = &os_api;
+    uint32_t prev_flags = api->launch_flags;
+    api->launch_flags = g_launch_flags;
 
     if (!name || !name[0]) {
         puts("exec: missing application name\n");
-        os_api.launch_flags = prev_flags;
+        api->launch_flags = prev_flags;
         return;
     }
     if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) {
         puts("exec: invalid application name\n");
-        os_api.launch_flags = prev_flags;
+        api->launch_flags = prev_flags;
         return;
     }
 
@@ -663,7 +749,7 @@ void shell_exec_app_command(const char *name) {
         cmd_ram_exec(app_path);
     }
 
-    os_api.launch_flags = prev_flags;
+    api->launch_flags = prev_flags;
 }
 
 static void enter_logged_user_home(void) {
@@ -702,7 +788,7 @@ static int is_at_storage_root(void) {
     if (shell_disk_primary_mode()) return 0;
     if (shell_location != SHELL_STORAGE) return 0;
     if (active_storage == STORAGE_DISK) return strcmp(disk_get_cwd_path(), "/") == 0;
-    return strcmp(storage_name(active_storage), "ram") == 0 && current_dir == fs_root;
+    return strcmp(storage_name(active_storage), "ram") == 0 && fs_current_dir() == fs_root;
 }
 
 static void reset_user_session(void) {
@@ -1131,39 +1217,51 @@ static void handle_command(char *line) {
         if (!users_effective_is_root()) puts("install: requires root\n");
         else run_install_wizard();
     } else if (strcmp(argv[0], "ls") == 0) {
-        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
-        else g_edit_open_path[0] = '\0';
+        if (argc > 1) {
+            strncpy(open_path_ptr(), argv[1], SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
+        } else open_path_ptr()[0] = '\0';
         shell_exec_app_command("ls");
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "cd") == 0) {
         cmd_cd_active(argc > 1 ? argv[1] : NULL);
     } else if (strcmp(argv[0], "pwd") == 0) {
         shell_exec_app_command("pwd");
     } else if (strcmp(argv[0], "mkdir") == 0) {
-        if (argc > 1) strncpy(g_edit_open_path, argv[argc - 1], sizeof(g_edit_open_path));
-        else g_edit_open_path[0] = '\0';
+        if (argc > 1) {
+            strncpy(open_path_ptr(), argv[argc - 1], SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
+        } else open_path_ptr()[0] = '\0';
         shell_exec_app_command("mkdir");
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "rmdir") == 0) {
-        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
-        else g_edit_open_path[0] = '\0';
+        if (argc > 1) {
+            strncpy(open_path_ptr(), argv[1], SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
+        } else open_path_ptr()[0] = '\0';
         shell_exec_app_command("rm"); // use rm app for rmdir if simple
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "touch") == 0) {
-        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
-        else g_edit_open_path[0] = '\0';
+        if (argc > 1) {
+            strncpy(open_path_ptr(), argv[1], SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
+        } else open_path_ptr()[0] = '\0';
         shell_exec_app_command("touch");
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "rm") == 0) {
-        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
-        else g_edit_open_path[0] = '\0';
+        if (argc > 1) {
+            strncpy(open_path_ptr(), argv[1], SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
+        } else open_path_ptr()[0] = '\0';
         shell_exec_app_command("rm");
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "cat") == 0) {
-        if (argc > 1) strncpy(g_edit_open_path, argv[1], sizeof(g_edit_open_path));
-        else g_edit_open_path[0] = '\0';
+        if (argc > 1) {
+            strncpy(open_path_ptr(), argv[1], SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
+        } else open_path_ptr()[0] = '\0';
         shell_exec_app_command("cat");
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "cp") == 0) {
         if (shell_disk_primary_mode()) {
             if (argc > 2) {
@@ -1182,16 +1280,16 @@ static void handle_command(char *line) {
         if (argc > 1) {
             // Allow "some path.txt" by re-joining all remaining args.
             join_args(joined, sizeof(joined), argv, 1, argc);
-            strncpy(g_edit_open_path, joined, sizeof(g_edit_open_path));
-            g_edit_open_path[sizeof(g_edit_open_path) - 1] = '\0';
+            strncpy(open_path_ptr(), joined, SHELL_OPEN_PATH_MAX);
+            open_path_ptr()[SHELL_OPEN_PATH_MAX - 1] = '\0';
         } else {
-            g_edit_open_path[0] = '\0';
+            open_path_ptr()[0] = '\0';
         }
 
         shell_exec_app_command(argv[0]);
 
         // Clear after launching app to avoid leaking path into the next run
-        g_edit_open_path[0] = '\0';
+        open_path_ptr()[0] = '\0';
     } else if (strcmp(argv[0], "disk") == 0) {
         if (argc < 2) puts("disk: missing command (devices, use, format, probe, ls, cd, pwd, mkdir, write, cat, rm)\n");
         else if (strcmp(argv[1], "devices") == 0 || strcmp(argv[1], "list") == 0) {
@@ -1241,6 +1339,17 @@ static void handle_command(char *line) {
     } else if (strcmp(argv[0], "exec") == 0) {
         if (argc > 1) shell_exec_app_command(argv[1]);
         else puts("exec: missing application name\n");
+    } else if (strcmp(argv[0], "open") == 0) {
+        if (argc < 2) {
+            puts("open: missing application name\n");
+        } else {
+            uint32_t flags = apps_registry_app_flags(argv[1]);
+            if (!(flags & MLJOS_APP_FLAG_GUI)) {
+                puts("open: application has no GUI\n");
+            } else if (!launcher_launch_gui(argv[1])) {
+                puts("open: failed to launch application\n");
+            }
+        }
     } else if (strcmp(argv[0], "help") == 0) {
         puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
         print_storage_help();
@@ -1305,11 +1414,11 @@ static void handle_command(char *line) {
 }
 
 void shell_run(void) {
-    os_api.ui = ui_api();
-    users_init();
-    (void)users_load_from_disk();
-    fs_init();
-    users_bootstrap_fs();
+    shell_boot();
+
+    task_t *t = task_current();
+    if (t && !t->api.puts) shell_init_task_api(t);
+    if (t && !t->fs_cwd) fs_enter_home();
 
     clear_screen();
     puts("Welcome to mljOS by foxgalaxy23\n");
@@ -1326,12 +1435,12 @@ void shell_run(void) {
         do_login();
     }
 
-    if (__builtin_setjmp(g_shell_jmp_env)) {
+    if (__builtin_setjmp(shell_jmp_env_ptr())) {
         COLOR = COLOR_DEFAULT;
         puts("\n^C\n");
         users_end_sudo();
     }
-    g_jmp_ready = 1;
+    *shell_jmp_ready_ptr() = 1;
     shell_run_autorun_scripts();
 
     {

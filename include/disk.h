@@ -29,6 +29,9 @@ int disk_save_user_config(const char *text);
 int disk_ensure_directory(const char *path);
 int disk_write_file(const char *path, const char *data, uint32_t size);
 int disk_read_file(const char *path, char *out, int maxlen, uint32_t *size_out);
+// Reads up to `maxlen` bytes from a file (binary-safe). Unlike disk_read_file,
+// does not require the file to fit in the buffer.
+int disk_read_file_prefix(const char *path, char *out, int maxlen, uint32_t *bytes_read_out);
 int disk_touch_file(const char *path);
 int disk_copy_file(const char *src_path, const char *dst_path);
 

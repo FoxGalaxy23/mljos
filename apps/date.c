@@ -1,6 +1,9 @@
 #include "sdk/mljos_api.h"
+#include "sdk/mljos_app.h"
 
-void _start(mljos_api_t *api) {
+MLJOS_APP_DEFINE("Date", MLJOS_APP_FLAG_TUI);
+
+MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     unsigned char d, mo;
     unsigned short y;
     api->get_date(&d, &mo, &y);

@@ -2,8 +2,11 @@
 #include "app_layout.h"
 #include "console.h"
 #include "disk.h"
+#include "kmem.h"
 #include "kstring.h"
+#include "sdk/mljos_app.h"
 #include "shell.h"
+#include "task.h"
 #include "users.h"
 #include "apps/calc_app.h"
 #include "apps/edit_app.h"
@@ -19,6 +22,7 @@
 #include "apps/clear_app.h"
 #include "apps/time_app.h"
 #include "apps/date_app.h"
+#include "apps/terminal_app.h"
 #include "boot/limine_bootx64_efi.h"
 #include "common.h"
 
@@ -37,7 +41,20 @@ static int fs_data_offset = 0;
 static uint16_t g_fs_umask = 0022;
 
 fs_node_t *fs_root = NULL;
-fs_node_t *current_dir = NULL;
+static fs_node_t *g_kernel_current_dir = NULL;
+
+fs_node_t *fs_current_dir(void) {
+    task_t *t = task_current();
+    if (t && t->fs_cwd) return t->fs_cwd;
+    return g_kernel_current_dir ? g_kernel_current_dir : fs_root;
+}
+
+void fs_set_current_dir(fs_node_t *dir) {
+    if (!dir) dir = fs_root;
+    task_t *t = task_current();
+    if (t) t->fs_cwd = dir;
+    else g_kernel_current_dir = dir;
+}
 
 static int fs_is_elf_image(const char *data, uint32_t size) {
     return size >= 4
@@ -130,7 +147,7 @@ static void build_node_path(fs_node_t *node, char *out, int out_size) {
 }
 
 void fs_get_cwd_path(char *out, int out_size) {
-    build_node_path(current_dir, out, out_size);
+    build_node_path(fs_current_dir(), out, out_size);
 }
 
 static int path_starts_with(const char *path, const char *prefix) {
@@ -448,7 +465,7 @@ void fs_init(void) {
     fs_root->child = NULL;
     fs_root->sibling = NULL;
     fs_root->content = NULL;
-    current_dir = fs_root;
+    fs_set_current_dir(fs_root);
 
     apps_dir = fs_create_node(fs_root, "apps", FS_DIR, 0, 0, 0755);
 
@@ -505,6 +522,9 @@ void fs_init(void) {
 
     fs_node_t *date = fs_create_node(apps_dir ? apps_dir : fs_root, "date.app", FS_FILE, 0, 0, 0755);
     if (date) { date->size = date_app_size; date->content = (char*)date_app_data; }
+
+    fs_node_t *terminal = fs_create_node(apps_dir ? apps_dir : fs_root, "terminal.app", FS_FILE, 0, 0, 0755);
+    if (terminal) { terminal->size = terminal_app_size; terminal->content = (char*)terminal_app_data; }
 
     // UEFI shell fallback: auto-launch default bootloader path.
     fs_node_t *startup = fs_create_node(fs_root, "startup.nsh", FS_FILE, 0, 0, 0644);
@@ -574,14 +594,14 @@ void fs_ensure_dir(const char *path, uint16_t uid, uint16_t gid, uint16_t mode) 
 void fs_enter_home(void) {
     const user_account_t *user = users_current();
     fs_node_t *home = user ? fs_resolve_node(fs_root, user->home) : fs_root;
-    current_dir = home ? home : fs_root;
+    fs_set_current_dir(home ? home : fs_root);
 }
 
 void fs_print_prompt_path(void) {
     char full[128];
     const user_account_t *user = users_current();
 
-    build_node_path(current_dir, full, sizeof(full));
+    build_node_path(fs_current_dir(), full, sizeof(full));
     if (user && path_starts_with(full, user->home)) {
         putchar('~');
         if (strlen(full) > strlen(user->home)) puts(full + strlen(user->home));
@@ -591,7 +611,8 @@ void fs_print_prompt_path(void) {
 }
 
 void cmd_ls_path(const char *path) {
-    fs_node_t *dir = path && path[0] ? fs_resolve_node(current_dir, path) : current_dir;
+    fs_node_t *cwd = fs_current_dir();
+    fs_node_t *dir = path && path[0] ? fs_resolve_node(cwd, path) : cwd;
     fs_node_t *curr;
 
     if (!dir) {
@@ -635,23 +656,23 @@ void cmd_cd(const char *path) {
         return;
     }
 
-    target = fs_resolve_node(current_dir, path);
+    target = fs_resolve_node(fs_current_dir(), path);
     if (!target) puts("cd: no such file or directory\n");
     else if (target->flags != FS_DIR) puts("cd: not a directory\n");
     else if (!fs_has_perm(target, FS_PERM_EXEC)) puts("cd: permission denied\n");
-    else current_dir = target;
+    else fs_set_current_dir(target);
 }
 
 void cmd_pwd(void) {
     char full[128];
-    build_node_path(current_dir, full, sizeof(full));
+    build_node_path(fs_current_dir(), full, sizeof(full));
     puts(full);
     putchar('\n');
 }
 
 void cmd_mkdir(const char *path) {
     char leaf[32];
-    fs_node_t *parent = fs_resolve_parent(current_dir, path, leaf, sizeof(leaf));
+    fs_node_t *parent = fs_resolve_parent(fs_current_dir(), path, leaf, sizeof(leaf));
     const user_account_t *user = users_effective();
 
     if (!parent || !leaf[0]) {
@@ -678,7 +699,7 @@ void cmd_mkdir_p(const char *path) {
     }
 
     expand_path(path, expanded, sizeof(expanded));
-    curr = expanded[0] == '/' ? fs_root : current_dir;
+    curr = expanded[0] == '/' ? fs_root : fs_current_dir();
 
     while (next_component(expanded, &index, component, sizeof(component))) {
         fs_node_t *next;
@@ -710,7 +731,7 @@ void cmd_mkdir_p(const char *path) {
 
 void cmd_rmdir(const char *path) {
     char leaf[32];
-    fs_node_t *parent = fs_resolve_parent(current_dir, path, leaf, sizeof(leaf));
+    fs_node_t *parent = fs_resolve_parent(fs_current_dir(), path, leaf, sizeof(leaf));
     fs_node_t *target;
 
     if (!parent || !leaf[0]) {
@@ -731,7 +752,7 @@ void cmd_rmdir(const char *path) {
         puts("rmdir: not a directory\n");
         return;
     }
-    if (target == fs_root || target == current_dir) {
+    if (target == fs_root || target == fs_current_dir()) {
         puts("rmdir: resource busy\n");
         return;
     }
@@ -745,7 +766,7 @@ void cmd_rmdir(const char *path) {
 
 void cmd_touch(const char *path) {
     char leaf[32];
-    fs_node_t *parent = fs_resolve_parent(current_dir, path, leaf, sizeof(leaf));
+    fs_node_t *parent = fs_resolve_parent(fs_current_dir(), path, leaf, sizeof(leaf));
     const user_account_t *user = users_effective();
 
     if (!parent || !leaf[0]) {
@@ -762,7 +783,7 @@ void cmd_touch(const char *path) {
 
 void cmd_rm(const char *path) {
     char leaf[32];
-    fs_node_t *parent = fs_resolve_parent(current_dir, path, leaf, sizeof(leaf));
+    fs_node_t *parent = fs_resolve_parent(fs_current_dir(), path, leaf, sizeof(leaf));
     fs_node_t *target;
 
     if (!parent || !leaf[0]) {
@@ -779,7 +800,7 @@ void cmd_rm(const char *path) {
         puts("rm: no such file or directory\n");
         return;
     }
-    if (target == fs_root || target == current_dir) {
+    if (target == fs_root || target == fs_current_dir()) {
         puts("rm: resource busy\n");
         return;
     }
@@ -792,7 +813,7 @@ void cmd_rm(const char *path) {
 }
 
 void cmd_cat(const char *path) {
-    fs_node_t *file = fs_resolve_node(current_dir, path);
+    fs_node_t *file = fs_resolve_node(fs_current_dir(), path);
 
     if (!file) puts("cat: no such file\n");
     else if (file->flags != FS_FILE) puts("cat: is a directory\n");
@@ -811,7 +832,7 @@ void cmd_write(const char *path, const char *text) {
 
 int fs_write_file(const char *path, const char *data, uint32_t size) {
     char leaf[32];
-    fs_node_t *parent = fs_resolve_parent(current_dir, path, leaf, sizeof(leaf));
+    fs_node_t *parent = fs_resolve_parent(fs_current_dir(), path, leaf, sizeof(leaf));
     fs_node_t *file;
     const user_account_t *user = users_effective();
 
@@ -844,7 +865,7 @@ int fs_write_file(const char *path, const char *data, uint32_t size) {
 }
 
 int fs_read_file(const char *path, char *out, int maxlen, uint32_t *size_out) {
-    fs_node_t *file = fs_resolve_node(current_dir, path);
+    fs_node_t *file = fs_resolve_node(fs_current_dir(), path);
 
     if (!file || !out || maxlen <= 0) return 0;
     if (file->flags != FS_FILE) return 0;
@@ -857,10 +878,25 @@ int fs_read_file(const char *path, char *out, int maxlen, uint32_t *size_out) {
     return 1;
 }
 
+int fs_read_file_prefix(const char *path, char *out, int maxlen, uint32_t *bytes_read_out) {
+    fs_node_t *file = fs_resolve_node(fs_current_dir(), path);
+
+    if (bytes_read_out) *bytes_read_out = 0;
+    if (!file || !out || maxlen <= 0) return 0;
+    if (file->flags != FS_FILE) return 0;
+    if (!fs_has_perm(file, FS_PERM_READ)) return 0;
+
+    uint32_t to_copy = file->size;
+    if (to_copy > (uint32_t)maxlen) to_copy = (uint32_t)maxlen;
+    for (uint32_t i = 0; i < to_copy; i++) out[i] = file->content ? file->content[i] : '\0';
+    if (bytes_read_out) *bytes_read_out = to_copy;
+    return 1;
+}
+
 void cmd_cp(const char *src_path, const char *dst_path) {
-    fs_node_t *src = fs_resolve_node(current_dir, src_path);
+    fs_node_t *src = fs_resolve_node(fs_current_dir(), src_path);
     char leaf[32];
-    fs_node_t *parent = fs_resolve_parent(current_dir, dst_path, leaf, sizeof(leaf));
+    fs_node_t *parent = fs_resolve_parent(fs_current_dir(), dst_path, leaf, sizeof(leaf));
     fs_node_t *dst;
     const user_account_t *user = users_effective();
 
@@ -908,7 +944,7 @@ void cmd_cp(const char *src_path, const char *dst_path) {
 }
 
 void cmd_chmod(const char *mode_text, const char *path) {
-    fs_node_t *node = fs_resolve_node(current_dir, path);
+    fs_node_t *node = fs_resolve_node(fs_current_dir(), path);
     uint16_t mode;
     const user_account_t *user = users_effective();
 
@@ -928,7 +964,7 @@ void cmd_chmod(const char *mode_text, const char *path) {
 }
 
 void cmd_chown(const char *owner_name, const char *path) {
-    fs_node_t *node = fs_resolve_node(current_dir, path);
+    fs_node_t *node = fs_resolve_node(fs_current_dir(), path);
     const user_account_t *owner = users_find(owner_name);
 
     if (!node) {
@@ -982,7 +1018,7 @@ int fs_resolve_app_command(const char *name, char *out, int out_size) {
 }
 
 int fs_can_exec_path(const char *path) {
-    fs_node_t *file = fs_resolve_node(current_dir, path);
+    fs_node_t *file = fs_resolve_node(fs_current_dir(), path);
 
     if (!file) return 0;
     if (file->flags != FS_FILE) return 0;
@@ -999,8 +1035,9 @@ int fs_list_dir_file_names(const char *path, char *out, int out_size) {
 
     if (!out || out_size <= 0) return 0;
     out[0] = '\0';
-    if (!path || !path[0]) dir = current_dir;
-    else dir = fs_resolve_node(current_dir, path);
+    fs_node_t *cwd = fs_current_dir();
+    if (!path || !path[0]) dir = cwd;
+    else dir = fs_resolve_node(cwd, path);
 
     if (!dir || dir->flags != FS_DIR) return 0;
     if (!fs_has_perm(dir, FS_PERM_READ)) return 0;
@@ -1020,7 +1057,7 @@ int fs_list_dir_file_names(const char *path, char *out, int out_size) {
 }
 
 void cmd_ram_exec(const char *path) {
-    fs_node_t *file = fs_resolve_node(current_dir, path);
+    fs_node_t *file = fs_resolve_node(fs_current_dir(), path);
 
     if (!file) {
         puts("exec: no such file\n");
@@ -1045,7 +1082,15 @@ void cmd_ram_exec(const char *path) {
 
     {
         char *app_start = (char *)(uintptr_t)MLJOS_APP_VADDR;
+        if (file->size > (uint32_t)MLJOS_APP_REGION_SIZE) {
+            puts("exec: app image too large\n");
+            return;
+        }
+        kmem_memset(app_start, 0, (uint64_t)MLJOS_APP_REGION_SIZE);
         for (uint32_t i = 0; i < file->size; i++) app_start[i] = file->content[i];
-        ((app_entry_t)app_start)(&os_api);
+        mljos_api_t *api = task_current_api();
+        if (!api || !api->puts) api = &os_api;
+        uint32_t off = mljos_app_entry_offset_from_image(app_start, file->size);
+        ((app_entry_t)(app_start + off))(api);
     }
 }

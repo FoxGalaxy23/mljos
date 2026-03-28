@@ -25,7 +25,10 @@ typedef struct fs_node {
 } fs_node_t;
 
 extern fs_node_t *fs_root;
-extern fs_node_t *current_dir;
+
+// Per-task current directory (RAM FS). Falls back to a kernel-global cwd if no task is active.
+fs_node_t *fs_current_dir(void);
+void fs_set_current_dir(fs_node_t *dir);
 
 void fs_init(void);
 void fs_enter_home(void);
@@ -54,6 +57,9 @@ int fs_resolve_app_command(const char *name, char *out, int out_size);
 int fs_can_exec_path(const char *path);
 int fs_list_dir_file_names(const char *path, char *out, int out_size);
 int fs_read_file(const char *path, char *out, int maxlen, uint32_t *size_out);
+// Reads up to `maxlen` bytes from a file (binary-safe). Unlike fs_read_file, does
+// not require the file to fit in the buffer and does not NUL-terminate.
+int fs_read_file_prefix(const char *path, char *out, int maxlen, uint32_t *bytes_read_out);
 int fs_write_file(const char *path, const char *data, uint32_t size);
 
 #endif

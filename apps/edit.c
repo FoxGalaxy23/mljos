@@ -1,4 +1,7 @@
 #include "sdk/mljos_api.h"
+#include "sdk/mljos_app.h"
+
+MLJOS_APP_DEFINE("Editor", MLJOS_APP_FLAG_TUI);
 
 #define MAX_LINES 128
 #define MAX_COLS 80
@@ -18,7 +21,7 @@ static void draw_status(mljos_api_t *api);
 static void draw_screen(mljos_api_t *api);
 static void prompt_save(mljos_api_t *api);
 
-void _start(mljos_api_t *api) {
+MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     // Initialization
     num_lines = 1;
     for (int i = 0; i < MAX_LINES; i++) {

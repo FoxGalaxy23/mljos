@@ -35,8 +35,4 @@ void wm_window_post_expose(wm_window_t *w);
 // Launcher request from Start menu
 int wm_consume_launch_request(char *out_name, int out_size);
 
-// Terminal window access (single instance for now)
-wm_window_t *wm_terminal_window(void);
-void wm_set_terminal_window(wm_window_t *w);
-
 #endif

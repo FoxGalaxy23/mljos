@@ -2,7 +2,6 @@
 #include "launcher.h"
 #include "shell.h"
 #include "task.h"
-#include "terminal_app.h"
 #include "wm.h"
 
 struct multiboot_tag {
@@ -36,8 +35,8 @@ void kernel_main(uintptr_t mbi) {
 
     task_init();
     wm_init();
-
-    (void)terminal_spawn();
+    console_set_visible(NULL, 0);
+    shell_boot();
 
     // Main WM + cooperative scheduler loop.
     for (;;) {

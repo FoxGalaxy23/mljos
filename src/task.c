@@ -2,6 +2,7 @@
 
 #include "app_layout.h"
 #include "kmem.h"
+#include "sdk/mljos_app.h"
 
 #define MAX_TASKS 16
 #define TASK_STACK_SIZE (64 * 1024)
@@ -66,7 +67,8 @@ static void app_trampoline(void) __attribute__((noreturn));
 static void app_trampoline(void) {
     task_t *t = g_current;
     if (!t) task_exit();
-    void (*app_entry)(mljos_api_t *) = (void (*)(mljos_api_t *))(uintptr_t)MLJOS_APP_VADDR;
+    uint32_t off = mljos_app_entry_offset_from_image((const void *)(uintptr_t)MLJOS_APP_VADDR, 0);
+    void (*app_entry)(mljos_api_t *) = (void (*)(mljos_api_t *))(uintptr_t)(MLJOS_APP_VADDR + (uint64_t)off);
     app_entry(&t->api);
     task_exit();
 }
@@ -120,6 +122,17 @@ static void init_task_common(task_t *t, const char *name) {
     t->entry = NULL;
     t->arg = NULL;
     t->window = NULL;
+    t->console = NULL;
+    t->fs_cwd = NULL;
+    t->shell_active_storage = 0;
+    t->shell_location = 1;
+    t->shell_launch_flags = 0;
+    t->shell_open_path[0] = '\0';
+    kmem_memset(t->shell_jmp_env, 0, sizeof(t->shell_jmp_env));
+    t->shell_jmp_ready = 0;
+    kmem_memset(t->shell_history, 0, sizeof(t->shell_history));
+    t->shell_history_count = 0;
+    t->shell_history_pos = -1;
     t->killed = 0;
     kmem_memset(&t->ctx, 0, sizeof(t->ctx));
     kmem_memset(&t->api, 0, sizeof(t->api));
@@ -188,6 +201,11 @@ task_t *task_create_app(const char *name, const void *image, uint32_t image_size
 void task_attach_window(task_t *t, struct wm_window *w) {
     if (!t) return;
     t->window = w;
+}
+
+void task_attach_console(task_t *t, console_t *c) {
+    if (!t) return;
+    t->console = c;
 }
 
 void task_kill(task_t *t) {

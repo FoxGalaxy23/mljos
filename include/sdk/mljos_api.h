@@ -55,6 +55,8 @@ typedef struct {
     void (*get_time)(uint8_t *h, uint8_t *m, uint8_t *s);
     void (*get_date)(uint8_t *d, uint8_t *mo, uint16_t *y);
     const char *open_path; // Optional: path to open on app startup (edit, etc.)
+    // Optional: run the built-in shell within the current task/window.
+    void (*run_shell)(void);
 
     // GUI mode / graphics (optional)
     uint32_t launch_flags;   // MLJOS_LAUNCH_*

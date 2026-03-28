@@ -17,7 +17,7 @@ ISO_IMAGE="$BUILD_DIR/mljOS.iso"
 
 INCLUDE_FLAGS="-I$ROOT_DIR/include -I$GENERATED_INCLUDE_DIR"
 CFLAGS="-m64 -nostdlib -nostdinc -ffreestanding -fno-builtin -fno-stack-protector -fno-pie -mno-red-zone"
-APP_CFLAGS="$CFLAGS"
+APP_CFLAGS="$CFLAGS -fno-asynchronous-unwind-tables -fno-unwind-tables"
 
 DEPS="gcc-x86-64-linux-gnu binutils-x86-64-linux-gnu nasm grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools ovmf git make gcc clang lld autoconf automake libtool mtools nasm"
 

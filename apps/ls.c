@@ -1,6 +1,9 @@
 #include "sdk/mljos_api.h"
+#include "sdk/mljos_app.h"
 
-void _start(mljos_api_t *api) {
+MLJOS_APP_DEFINE("LS", MLJOS_APP_FLAG_TUI);
+
+MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     char buf[1024];
     const char *path = (api->open_path && api->open_path[0]) ? api->open_path : ".";
     

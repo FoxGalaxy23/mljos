@@ -9,6 +9,9 @@
  */
 
 #include "sdk/mljos_api.h"
+#include "sdk/mljos_app.h"
+
+MLJOS_APP_DEFINE("Microcoder", MLJOS_APP_FLAG_TUI);
 
 // Prototypes
 static int compile_and_run(mljos_api_t *api, const char *program_text, const char *output_path);
@@ -24,7 +27,7 @@ static void strcpy(char *dst, const char *src);
 #define NULL ((void*)0)
 #endif
 
-void _start(mljos_api_t *api) {
+MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     if (!api || !api->open_path || !api->open_path[0]) {
         if (api) {
             api->puts("Tiny-C microcoder for mljOS\n");
@@ -1014,5 +1017,3 @@ static int compile_and_run(mljos_api_t *api, const char *program_text, const cha
         }
     }
 }
-
-

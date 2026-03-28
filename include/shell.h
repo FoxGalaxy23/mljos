@@ -5,7 +5,10 @@
 #include "sdk/mljos_api.h"
 
 extern mljos_api_t os_api;
+void shell_boot(void);
 void shell_run(void);
+struct task;
+void shell_init_task_api(struct task *t);
 // Launch bundled app by command name (e.g. "calc").
 // Exposed for GUI start menu.
 void shell_exec_app_command(const char *name);
