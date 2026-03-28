@@ -117,6 +117,61 @@ static int g_disk_device_count = 0;
 static int g_disk_io_error = 0;
 static int g_disk_system_index = -1;
 
+// Cooperative-disk exclusive section.
+// Some operations (like formatting) do long synchronous I/O loops. Because the kernel scheduler is
+// cooperative, we must periodically `task_yield()` during those loops to keep WM responsive.
+// Yielding in the middle of disk/FAT32 work would allow another task to enter disk APIs and corrupt
+// global state (active device, FAT mount, CWD, etc). To prevent that, long operations acquire this
+// exclusive owner and all public disk APIs will refuse to run while another task holds it.
+static task_t *g_disk_exclusive_owner = NULL;
+static uint32_t g_disk_exclusive_depth = 0;
+
+static task_t *disk_current_owner_tag(void) {
+    task_t *t = task_current();
+    // Use a non-NULL sentinel for kernel context.
+    return t ? t : (task_t *)(uintptr_t)1;
+}
+
+static int disk_exclusive_held_by_other(void) {
+    if (!g_disk_exclusive_owner) return 0;
+    return g_disk_exclusive_owner != disk_current_owner_tag();
+}
+
+static int disk_require_not_busy_quiet(void) {
+    return !disk_exclusive_held_by_other();
+}
+
+static int disk_require_not_busy(const char *context) {
+    if (disk_require_not_busy_quiet()) return 1;
+    puts(context);
+    puts(": disk is busy\n");
+    return 0;
+}
+
+static void disk_exclusive_begin(void) {
+    task_t *me = disk_current_owner_tag();
+    if (!g_disk_exclusive_owner) {
+        g_disk_exclusive_owner = me;
+        g_disk_exclusive_depth = 1;
+        return;
+    }
+    if (g_disk_exclusive_owner == me) {
+        g_disk_exclusive_depth++;
+    }
+}
+
+static void disk_exclusive_end(void) {
+    task_t *me = disk_current_owner_tag();
+    if (!g_disk_exclusive_owner || g_disk_exclusive_owner != me) return;
+    if (g_disk_exclusive_depth > 0) g_disk_exclusive_depth--;
+    if (g_disk_exclusive_depth == 0) g_disk_exclusive_owner = NULL;
+}
+
+static inline void disk_io_breathe(uint32_t i) {
+    // Yield roughly every 64 sectors to keep UI latency reasonable.
+    if ((i & 63U) == 63U) task_yield();
+}
+
 static int fat32_build_short_name(const char *name, uint8_t out[11]);
 static void disk_probe_devices(void);
 static fat32_volume_t *disk_current_volume(void);
@@ -530,14 +585,17 @@ static void disk_probe_devices(void) {
 }
 
 void disk_probe_devices_reset(void) {
+    if (!disk_require_not_busy("disk probe")) return;
     g_disk_devices_probed = 0;
 }
 
 int disk_get_system_device(void) {
+    if (!disk_require_not_busy_quiet()) return -1;
     return g_disk_system_index;
 }
 
 void disk_set_system_device(int index) {
+    if (!disk_require_not_busy_quiet()) return;
     if (index >= 0 && index < DISK_MAX_DEVICES) g_disk_system_index = index;
 }
 
@@ -566,6 +624,7 @@ static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
                 return;
             }
             if (i % 128 == 0) usb_delay(); // Periodic breather for slow sticks
+            disk_io_breathe(i);
         }
     } else {
         for (uint32_t i = 0; i < count; i++) {
@@ -573,6 +632,7 @@ static void ata_write_zero_sectors(uint32_t lba, uint32_t count) {
                 g_disk_io_error = 1;
                 return;
             }
+            disk_io_breathe(i);
         }
     }
 }
@@ -1383,16 +1443,19 @@ static int fat32_write_entry_chain(const fat32_dir_slot_t *slots, int count, con
 }
 
 int disk_get_device_count(void) {
+    if (!disk_require_not_busy_quiet()) return 0;
     disk_probe_devices();
     return g_disk_device_count;
 }
 
 int disk_get_active_device(void) {
+    if (!disk_require_not_busy_quiet()) return -1;
     if (!disk_current_device()) return -1;
     return g_disk_active_index;
 }
 
 int disk_select_device(int index) {
+    if (!disk_require_not_busy("disk use")) return 0;
     disk_probe_devices();
     if (index < 0 || index >= g_disk_device_count || g_disk_devices[index].type == DISK_BACKEND_NONE) return 0;
     g_disk_active_index = index;
@@ -1400,6 +1463,7 @@ int disk_select_device(int index) {
 }
 
 void cmd_disk_devices(void) {
+    if (!disk_require_not_busy("disk devices")) return;
     disk_probe_devices();
     for (int i = 0; i < g_disk_device_count; i++) {
         uint32_t size_mb = g_disk_devices[i].total_sectors / 2048U;
@@ -1431,8 +1495,8 @@ static int disk_current_is_writable(void) {
 }
 
 void cmd_disk_format(void) {
-    disk_device_t *device = disk_current_device();
-    uint32_t total_sectors = device ? device->total_sectors : 0;
+    disk_device_t *device = NULL;
+    uint32_t total_sectors = 0;
     uint32_t partition_lba = 2048;
     uint8_t sector[512];
     uint8_t fsinfo[512];
@@ -1447,20 +1511,26 @@ void cmd_disk_format(void) {
 
     g_disk_io_error = 0;
 
-    if (!disk_require_active_device("disk format")) return;
+    if (!disk_require_not_busy("disk format")) return;
+    disk_exclusive_begin();
+
+    device = disk_current_device();
+    total_sectors = device ? device->total_sectors : 0;
+
+    if (!disk_require_active_device("disk format")) goto out;
     if (!device || !device->writable) {
         puts("disk format: available only for writable disks\n");
-        return;
+        goto out;
     }
 
     if (total_sectors == 0) {
         puts("disk format: unable to identify disk\n");
-        return;
+        goto out;
     }
 
     if (total_sectors <= partition_lba + 65536U) {
         puts("disk format: disk is too small for MBR + FAT32\n");
-        return;
+        goto out;
     }
 
     volume_sectors = total_sectors - partition_lba;
@@ -1486,7 +1556,7 @@ void cmd_disk_format(void) {
 
     if (cluster_count < FAT32_MIN_CLUSTERS || cluster_count > FAT32_MAX_CLUSTERS) {
         puts("disk format: disk geometry is not suitable for FAT32\n");
-        return;
+        goto out;
     }
 
     if (device->type == DISK_BACKEND_USB) {
@@ -1496,7 +1566,7 @@ void cmd_disk_format(void) {
             usb_delay();
             if (retry == 9) {
                 puts("disk format: USB device not ready (timeout)\n");
-                return;
+                goto out;
             }
         }
     }
@@ -1514,7 +1584,7 @@ void cmd_disk_format(void) {
     ata_write_zero_sectors(partition_lba + reserved_sector_count, num_fats * fat_size);
     if (g_disk_io_error) {
         puts("disk format: disk write failed while clearing metadata area (I/O error)\n");
-        return;
+        goto out;
     }
 
 
@@ -1570,7 +1640,7 @@ void cmd_disk_format(void) {
         || !ata_write_sector(partition_lba + 6, sector)
         || !ata_write_sector(partition_lba + 7, fsinfo)) {
         puts("disk format: failed to write FAT32 boot sectors\n");
-        return;
+        goto out;
     }
 
     kmemset(sector, 0, sizeof(sector));
@@ -1580,7 +1650,7 @@ void cmd_disk_format(void) {
     if (!ata_write_sector(partition_lba + reserved_sector_count, sector)
         || !ata_write_sector(partition_lba + reserved_sector_count + fat_size, sector)) {
         puts("disk format: failed to initialize FAT tables\n");
-        return;
+        goto out;
     }
 
     // We already zeroed the rest of the FAT area above, so we don't need to do it again here.
@@ -1589,7 +1659,7 @@ void cmd_disk_format(void) {
     ata_write_zero_sectors(partition_lba + reserved_sector_count + (num_fats * fat_size), sectors_per_cluster);
     if (g_disk_io_error) {
         puts("disk format: disk write failed while zeroing data region (I/O error)\n");
-        return;
+        goto out;
     }
 
 
@@ -1597,10 +1667,13 @@ void cmd_disk_format(void) {
     fat32_reset_cwd();
     if (!fat32_mount()) {
         puts("disk format: FAT32 mount failed after format\n");
-        return;
+        goto out;
     }
 
     puts("Disk formatted as FAT32.\n");
+
+out:
+    disk_exclusive_end();
 }
 
 void cmd_disk_ls(const char *path) {
@@ -1617,6 +1690,7 @@ void cmd_disk_ls(const char *path) {
     int lfn_valid = 0;
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk ls")) return;
     if (!disk_require_active_device("disk ls")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
@@ -1729,6 +1803,7 @@ int disk_list_dir_file_names(const char *path, char *out, int out_size) {
     out[0] = '\0';
     if (!out_size || !out) return 0;
     if (!path) path = "/";
+    if (!disk_require_not_busy_quiet()) return 0;
 
     g_disk_io_error = 0;
     if (!disk_require_active_device("disk ls")) return 0;
@@ -1817,6 +1892,7 @@ int disk_list_dir_file_names(const char *path, char *out, int out_size) {
 }
 
 void disk_prepare_session(void) {
+    if (!disk_require_not_busy_quiet()) return;
     (void)disk_current_device();
     fat32_reset_cwd();
     g_disk_io_error = 0;
@@ -1829,6 +1905,7 @@ void cmd_disk_cd(const char *path) {
     fat32_lookup_result_t entry;
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk cd")) return;
     if (!disk_require_active_device("disk cd")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
@@ -1860,6 +1937,7 @@ void cmd_disk_cd(const char *path) {
 
 void cmd_disk_pwd(void) {
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk pwd")) return;
     if (!disk_require_active_device("disk pwd")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
@@ -1881,6 +1959,7 @@ void cmd_disk_mkdir(const char *path) {
     int entry_count;
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk mkdir")) return;
     if (!disk_require_active_device("disk mkdir")) return;
     if (!disk_current_is_writable()) {
         puts("disk mkdir: device is read-only\n");
@@ -1957,6 +2036,7 @@ void cmd_disk_write(const char *path, const char *text) {
     int entry_count;
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk write")) return;
     if (!disk_require_active_device("disk write")) return;
     if (!disk_current_is_writable()) {
         puts("disk write: device is read-only\n");
@@ -2217,6 +2297,7 @@ int disk_read_file(const char *path, char *out, int maxlen, uint32_t *size_out) 
     int offset = 0;
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!fat32_mount()) return 0;
     if (!fat32_normalize_path(path, resolved_path) || strcmp(resolved_path, "/") == 0) return 0;
     if (!fat32_resolve_path(resolved_path, NULL, &entry)) return 0;
@@ -2259,6 +2340,7 @@ int disk_read_file_prefix(const char *path, char *out, int maxlen, uint32_t *byt
     if (bytes_read_out) *bytes_read_out = 0;
     g_disk_io_error = 0;
     if (!out || maxlen <= 0) return 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!fat32_mount()) return 0;
     if (!fat32_normalize_path(path, resolved_path) || strcmp(resolved_path, "/") == 0) return 0;
     if (!fat32_resolve_path(resolved_path, NULL, &entry)) return 0;
@@ -2288,12 +2370,14 @@ int disk_read_file_prefix(const char *path, char *out, int maxlen, uint32_t *byt
 
 int disk_load_user_config(char *out, int maxlen) {
     g_disk_io_error = 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!fat32_mount()) return 0;
     return disk_read_text_file_internal("/system/users.cfg", out, maxlen);
 }
 
 int disk_save_user_config(const char *text) {
     g_disk_io_error = 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
     if (!fat32_ensure_directory_quiet("/system")) return 0;
@@ -2302,6 +2386,7 @@ int disk_save_user_config(const char *text) {
 
 int disk_ensure_directory(const char *path) {
     g_disk_io_error = 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
     return fat32_ensure_directory_quiet(path);
@@ -2309,6 +2394,7 @@ int disk_ensure_directory(const char *path) {
 
 int disk_write_file(const char *path, const char *data, uint32_t size) {
     g_disk_io_error = 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!disk_current_is_writable()) return 0;
     if (!fat32_mount()) return 0;
     return disk_write_file_internal(path, data ? data : "", size);
@@ -2335,6 +2421,7 @@ void cmd_disk_cat(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk cat")) return;
     if (!disk_require_active_device("disk cat")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
@@ -2388,6 +2475,7 @@ void cmd_disk_rm(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk rm")) return;
     if (!disk_require_active_device("disk rm")) return;
     if (!disk_current_is_writable()) {
         puts("disk rm: device is read-only\n");
@@ -2438,6 +2526,7 @@ void cmd_disk_rm(const char *path) {
 }
 
 const char *disk_get_cwd_path(void) {
+    if (!disk_require_not_busy_quiet()) return "/";
     return g_fat32.current_path[0] ? g_fat32.current_path : "/";
 }
 
@@ -2447,10 +2536,13 @@ void cmd_disk_install(void) {
     uint32_t num_sectors = (kernel_size + 511) / 512;
     uint8_t sector0[512];
 
-    if (!disk_require_active_device("disk install")) return;
+    if (!disk_require_not_busy("disk install")) return;
+    disk_exclusive_begin();
+
+    if (!disk_require_active_device("disk install")) goto out;
     if (!disk_current_is_writable()) {
         puts("disk install: available only for writable disks\n");
-        return;
+        goto out;
     }
 
     puts("Installing OS to disk...");
@@ -2464,11 +2556,15 @@ void cmd_disk_install(void) {
     for (uint32_t i = 0; i < num_sectors; i++) {
         if (!ata_write_sector(1 + i, kmem + (i * 512))) {
             puts("Failed to write kernel data to disk\n");
-            return;
+            goto out;
         }
+        disk_io_breathe(i);
     }
 
     puts("Install complete! You can now boot directly from this hard disk.\n");
+
+out:
+    disk_exclusive_end();
 }
 
 void cmd_disk_exec(const char *path) {
@@ -2480,6 +2576,7 @@ void cmd_disk_exec(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy("disk exec")) return;
     if (!disk_require_active_device("disk exec")) return;
     if (!fat32_mount()) {
         puts("Disk not formatted as FAT32.\n");
@@ -2551,6 +2648,7 @@ int disk_can_exec_path(const char *path) {
     char resolved_path[128];
 
     g_disk_io_error = 0;
+    if (!disk_require_not_busy_quiet()) return 0;
     if (!fat32_mount()) return 0;
     if (!fat32_normalize_path(path, resolved_path) || strcmp(resolved_path, "/") == 0) return 0;
     if (!fat32_resolve_path(resolved_path, NULL, &entry)) return 0;
