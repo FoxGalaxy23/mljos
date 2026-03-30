@@ -407,8 +407,8 @@ static void gui_draw_text_transparent(const char *s, int x_px, int y_px, uint32_
 static void gui_apply_console_viewport(int redraw_console) {
     if (g_in_dos_mode) {
         console_set_viewport(0, 0, fb_root.width, fb_root.height);
-        console_set_visible(1);
-        if (redraw_console) console_redraw();
+        console_set_visible(NULL, 1);
+        if (redraw_console) console_redraw(NULL);
         return;
     }
 
@@ -426,8 +426,8 @@ static void gui_apply_console_viewport(int redraw_console) {
     console_set_viewport((uint32_t)inner_left_px, (uint32_t)inner_top_px, (uint32_t)inner_w_px, (uint32_t)inner_h_px);
 
     int should_show = !g_terminal_minimized && !g_terminal_closed;
-    console_set_visible(should_show);
-    if (redraw_console && should_show) console_redraw();
+    console_set_visible(NULL, should_show);
+    if (redraw_console && should_show) console_redraw(NULL);
 }
 
 static void gui_draw_window_frame(void) {
@@ -1115,4 +1115,3 @@ void gui_move_terminal(int dx_chars, int dy_chars) {
 
     gui_draw_desktop(1);
 }
-

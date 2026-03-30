@@ -10,12 +10,13 @@ static void terminal_task_main(void *arg) {
     task_t *t = task_current();
     if (t && t->window) {
         console_bind_target(
+            NULL,
             wm_window_client_pixels(t->window),
             (uint32_t)wm_window_client_w(t->window),
             (uint32_t)wm_window_client_h(t->window),
             wm_window_client_pitch_bytes(t->window)
         );
-        console_set_visible(1);
+        console_set_visible(NULL, 1);
         clear_screen();
         wm_mark_dirty();
     }
@@ -46,4 +47,3 @@ int terminal_spawn(void) {
     wm_window_focus(term_win);
     return 1;
 }
-

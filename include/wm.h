@@ -22,6 +22,10 @@ void wm_window_set_owner(wm_window_t *w, struct task *owner);
 // Reap windows whose owners already exited after a close request.
 void wm_reap_closed_windows(void);
 
+// Terminal window tracking (optional helper for singleton terminal).
+wm_window_t *wm_terminal_window(void);
+void wm_set_terminal_window(wm_window_t *w);
+
 // Window query
 int wm_window_client_w(const wm_window_t *w);
 int wm_window_client_h(const wm_window_t *w);

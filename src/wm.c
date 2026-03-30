@@ -72,6 +72,7 @@ static int g_zcount = 0;
 static int g_next_id = 1;
 
 static wm_window_t *g_focused = NULL;
+static wm_window_t *g_terminal_window = NULL;
 
 static int g_dirty = 1;
 static int g_start_open = 0;
@@ -671,6 +672,7 @@ void wm_init(void) {
     g_zcount = 0;
     g_next_id = 1;
     g_focused = NULL;
+    g_terminal_window = NULL;
     g_start_open = 0;
     g_has_launch_req = 0;
     g_drag_mode = DRAG_NONE;
@@ -741,6 +743,7 @@ wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_p
 
 void wm_window_destroy(wm_window_t *w) {
     if (!w) return;
+    if (g_terminal_window == w) g_terminal_window = NULL;
     w->used = 0;
     if (g_focused == w) g_focused = NULL;
     z_rebuild();
@@ -771,6 +774,14 @@ void wm_window_focus(wm_window_t *w) {
     z_focus_index(idx);
     wm_mark_dirty();
     win_post_expose(w);
+}
+
+wm_window_t *wm_terminal_window(void) {
+    return g_terminal_window;
+}
+
+void wm_set_terminal_window(wm_window_t *w) {
+    g_terminal_window = w;
 }
 
 int wm_window_client_w(const wm_window_t *w) { return w ? w->client_w : 0; }
