@@ -37,6 +37,61 @@ int bmp_scale_nearest_rgb32(const uint32_t *src, int src_w, int src_h, uint32_t 
     return 1;
 }
 
+int bmp_scale_bilinear_rgb32(const uint32_t *src, int src_w, int src_h, uint32_t **out_px, int dst_w, int dst_h) {
+    if (!src || !out_px || dst_w <= 0 || dst_h <= 0 || src_w <= 0 || src_h <= 0) return 0;
+
+    uint64_t bytes = (uint64_t)dst_w * (uint64_t)dst_h * 4ULL;
+    uint32_t *dst = (uint32_t *)kmem_alloc(bytes, 16);
+    if (!dst) return 0;
+
+    for (int y = 0; y < dst_h; ++y) {
+        float v = (dst_h == 1) ? 0.0f : (float)y * (float)(src_h - 1) / (float)(dst_h - 1);
+        int y0 = (int)v;
+        int y1 = (y0 + 1 < src_h) ? (y0 + 1) : y0;
+        float fy = v - (float)y0;
+        for (int x = 0; x < dst_w; ++x) {
+            float u = (dst_w == 1) ? 0.0f : (float)x * (float)(src_w - 1) / (float)(dst_w - 1);
+            int x0 = (int)u;
+            int x1 = (x0 + 1 < src_w) ? (x0 + 1) : x0;
+            float fx = u - (float)x0;
+
+            uint32_t c00 = src[y0 * src_w + x0];
+            uint32_t c10 = src[y0 * src_w + x1];
+            uint32_t c01 = src[y1 * src_w + x0];
+            uint32_t c11 = src[y1 * src_w + x1];
+
+            float w00 = (1.0f - fx) * (1.0f - fy);
+            float w10 = fx * (1.0f - fy);
+            float w01 = (1.0f - fx) * fy;
+            float w11 = fx * fy;
+
+            float r = ((float)((c00 >> 16) & 0xFF) * w00) +
+                      ((float)((c10 >> 16) & 0xFF) * w10) +
+                      ((float)((c01 >> 16) & 0xFF) * w01) +
+                      ((float)((c11 >> 16) & 0xFF) * w11);
+            float g = ((float)((c00 >> 8) & 0xFF) * w00) +
+                      ((float)((c10 >> 8) & 0xFF) * w10) +
+                      ((float)((c01 >> 8) & 0xFF) * w01) +
+                      ((float)((c11 >> 8) & 0xFF) * w11);
+            float b = ((float)(c00 & 0xFF) * w00) +
+                      ((float)(c10 & 0xFF) * w10) +
+                      ((float)(c01 & 0xFF) * w01) +
+                      ((float)(c11 & 0xFF) * w11);
+
+            uint32_t rr = (uint32_t)(r + 0.5f);
+            uint32_t gg = (uint32_t)(g + 0.5f);
+            uint32_t bb = (uint32_t)(b + 0.5f);
+            if (rr > 255u) rr = 255u;
+            if (gg > 255u) gg = 255u;
+            if (bb > 255u) bb = 255u;
+            dst[y * dst_w + x] = (rr << 16) | (gg << 8) | bb;
+        }
+    }
+
+    *out_px = dst;
+    return 1;
+}
+
 int bmp_decode_rgb32(const void *data, uint32_t size, uint32_t **out_px, int *out_w, int *out_h) {
     if (!data || size < 54 || !out_px || !out_w || !out_h) return 0;
     const uint8_t *p = (const uint8_t *)data;
@@ -137,4 +192,3 @@ int bmp_decode_rgb32(const void *data, uint32_t size, uint32_t **out_px, int *ou
     *out_h = (int)height;
     return 1;
 }
-

@@ -7,10 +7,16 @@
 typedef struct wm_window wm_window_t;
 struct task;
 
+typedef enum wm_icon_scale_mode {
+    WM_ICON_SCALE_NEAREST = 0,
+    WM_ICON_SCALE_BILINEAR = 1,
+} wm_icon_scale_mode_t;
+
 void wm_init(void);
 void wm_pump_input(void);
 void wm_compose_if_dirty(void);
 void wm_mark_dirty(void);
+void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode);
 
 // Window lifecycle
 wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_px);

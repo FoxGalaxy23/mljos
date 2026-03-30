@@ -13,5 +13,8 @@ int bmp_decode_rgb32(const void *data, uint32_t size, uint32_t **out_px, int *ou
 // Allocates output with kmem_alloc().
 int bmp_scale_nearest_rgb32(const uint32_t *src, int src_w, int src_h, uint32_t **out_px, int dst_w, int dst_h);
 
-#endif
+// Bilinear scaling of packed 0x00RRGGBB pixels.
+// Allocates output with kmem_alloc().
+int bmp_scale_bilinear_rgb32(const uint32_t *src, int src_w, int src_h, uint32_t **out_px, int dst_w, int dst_h);
 
+#endif

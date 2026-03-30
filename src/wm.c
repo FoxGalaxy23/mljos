@@ -15,6 +15,8 @@
 
 #define WM_MAX_WINDOWS 16
 #define WM_MAX_EVENTS 64
+static const int ICON_DRAW_PX = 48;
+static const uint32_t ICON_MAX_BYTES = 8u * 1024u * 1024u;
 
 // Decoration metrics
 static const int BORDER_PX = 2;
@@ -212,7 +214,10 @@ static int g_wallpaper_h = 0;
 typedef struct wm_icon_entry {
     char name[32];
     uint8_t loaded;
-    uint32_t *px16; // 16x16, 0x00RRGGBB
+    uint32_t *px_scaled; // ICON_DRAW_PX x ICON_DRAW_PX, 0x00RRGGBB
+    int scaled_w;
+    int scaled_h;
+    wm_icon_scale_mode_t scaled_mode;
 } wm_icon_entry_t;
 
 static wm_icon_entry_t g_icon_cache[WM_ICON_CACHE_MAX];
@@ -220,7 +225,13 @@ static wm_icon_entry_t g_icon_cache[WM_ICON_CACHE_MAX];
 static uint32_t screen_w(void) { return fb_root.width; }
 static uint32_t screen_h(void) { return fb_root.height; }
 
-static uint32_t *wm_get_app_icon16(const char *app_name);
+static uint32_t *wm_get_app_icon_scaled(const char *app_name, int target_px);
+static int load_icon_file_exact(const char *path, void **out_buf, uint32_t *out_size);
+static uint32_t rd_u32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static wm_icon_scale_mode_t g_icon_scale_mode = WM_ICON_SCALE_NEAREST;
 
 static int rect_contains(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && y >= ry && x < rx + rw && y < ry + rh;
@@ -515,16 +526,49 @@ static void draw_start_menu(uint32_t *dst, uint32_t pitch, int sw, int sh) {
     fill_rect(dst, pitch, sw, sh, x0 + menu_w - 2, y0, 2, menu_h, COL_WIN_BORDER);
     fill_rect(dst, pitch, sw, sh, x0, y0 + menu_h - 2, menu_w, 2, COL_WIN_BORDER);
 
-    int y = y0 + 10;
+    int pad = 10;
+    int content_w = menu_w - pad * 2;
+    int content_h = menu_h - pad * 2;
+    int cell_h = ICON_DRAW_PX + 16 + 6;
+    if (cell_h < ICON_DRAW_PX + 8) cell_h = ICON_DRAW_PX + 8;
+    int cols = content_w / (ICON_DRAW_PX + 12);
+    if (cols < 1) cols = 1;
+    int cell_w = content_w / cols;
+    if (cell_w < ICON_DRAW_PX) cell_w = ICON_DRAW_PX;
+    int rows = content_h / cell_h;
+    if (rows < 1) rows = 1;
+
+    int y = y0 + pad;
     int count = 0;
     const mljos_app_descriptor_t *apps = apps_registry_list(&count);
+    int col = 0;
+    int row = 0;
     for (int i = 0; i < count; ++i) {
         if (!apps[i].supports_ui) continue;
-        uint32_t *icon = wm_get_app_icon16(apps[i].name);
-        if (icon) blit_rgb32(dst, pitch, sw, sh, x0 + 10, y - 1, icon, 16, 16);
-        draw_text(dst, pitch, sw, sh, apps[i].title ? apps[i].title : apps[i].name, x0 + (icon ? 30 : 10), y, 0xFFFFFF);
-        y += 22;
-        if (y > y0 + menu_h - 24) break;
+        int cell_x = x0 + pad + col * cell_w;
+        int cell_y = y0 + pad + row * cell_h;
+        if (cell_y + cell_h > y0 + menu_h - pad) break;
+
+        uint32_t *icon = wm_get_app_icon_scaled(apps[i].name, ICON_DRAW_PX);
+        int icon_x = cell_x + (cell_w - ICON_DRAW_PX) / 2;
+        int icon_y = cell_y;
+        if (icon) blit_rgb32(dst, pitch, sw, sh, icon_x, icon_y, icon, ICON_DRAW_PX, ICON_DRAW_PX);
+
+        const char *label = apps[i].title ? apps[i].title : apps[i].name;
+        int max_chars = cell_w / 8;
+        if (max_chars < 1) max_chars = 1;
+        char tmp[32];
+        int li = 0;
+        while (label[li] && li < (int)sizeof(tmp) - 1 && li < max_chars) { tmp[li] = label[li]; li++; }
+        tmp[li] = '\0';
+        int text_px = li * 8;
+        int text_x = cell_x + (cell_w - text_px) / 2;
+        int text_y = cell_y + ICON_DRAW_PX + 2;
+        draw_text(dst, pitch, sw, sh, tmp, text_x, text_y, 0xFFFFFF);
+
+        col++;
+        if (col >= cols) { col = 0; row++; }
+        if (row >= rows) break;
     }
 }
 
@@ -626,13 +670,54 @@ static int build_icon_path(char *out, int out_size, const char *prefix, const ch
     return pos > 0;
 }
 
-static uint32_t *wm_get_app_icon16(const char *app_name) {
+static int load_icon_file_exact(const char *path, void **out_buf, uint32_t *out_size) {
+    if (!path || !out_buf || !out_size) return 0;
+    *out_buf = NULL;
+    *out_size = 0;
+
+    uint8_t header[54];
+    uint32_t got = 0;
+    int ok = 0;
+
+    if (users_system_is_installed()) {
+        ok = disk_read_file_prefix(path, (char *)header, (int)sizeof(header), &got);
+        if (!ok) ok = fs_read_file_prefix(path, (char *)header, (int)sizeof(header), &got);
+    } else {
+        ok = fs_read_file_prefix(path, (char *)header, (int)sizeof(header), &got);
+        if (!ok) ok = disk_read_file_prefix(path, (char *)header, (int)sizeof(header), &got);
+    }
+    if (!ok || got < 54) return 0;
+    if (header[0] != 'B' || header[1] != 'M') return 0;
+    uint32_t file_size = rd_u32_le(header + 2);
+    if (file_size < 54 || file_size > ICON_MAX_BYTES) return 0;
+
+    char *buf = (char *)kmem_alloc((uint64_t)file_size, 16);
+    if (!buf) return 0;
+
+    if (users_system_is_installed()) {
+        ok = disk_read_file(path, buf, (int)file_size, &got);
+        if (!ok) ok = fs_read_file_prefix(path, buf, (int)file_size, &got);
+    } else {
+        ok = fs_read_file_prefix(path, buf, (int)file_size, &got);
+        if (!ok) ok = disk_read_file(path, buf, (int)file_size, &got);
+    }
+
+    if (!ok || got != file_size) return 0;
+    *out_buf = buf;
+    *out_size = file_size;
+    return 1;
+}
+
+static uint32_t *wm_get_app_icon_scaled(const char *app_name, int target_px) {
     wm_icon_entry_t *e = icon_cache_find_or_alloc(app_name);
     if (!e) return NULL;
-    if (e->loaded) return e->px16;
+    if (e->loaded && e->scaled_w == target_px && e->scaled_h == target_px && e->scaled_mode == g_icon_scale_mode) return e->px_scaled;
 
     e->loaded = 1; // mark as attempted
-    e->px16 = NULL;
+    e->px_scaled = NULL;
+    e->scaled_w = 0;
+    e->scaled_h = 0;
+    e->scaled_mode = g_icon_scale_mode;
 
     const char *prefixes[] = {
         "/apps/icons/",
@@ -646,7 +731,7 @@ static uint32_t *wm_get_app_icon16(const char *app_name) {
 
         void *file = NULL;
         uint32_t file_size = 0;
-        if (!load_file_anywhere(path, &file, &file_size, 512u * 1024u)) continue;
+        if (!load_icon_file_exact(path, &file, &file_size)) continue;
 
         uint32_t *px = NULL;
         int w = 0;
@@ -654,13 +739,19 @@ static uint32_t *wm_get_app_icon16(const char *app_name) {
         if (!bmp_decode_rgb32(file, file_size, &px, &w, &h)) continue;
 
         uint32_t *scaled = NULL;
-        if (w == 16 && h == 16) scaled = px;
+        if (w == target_px && h == target_px) scaled = px;
         else {
-            if (!bmp_scale_nearest_rgb32(px, w, h, &scaled, 16, 16)) continue;
+            if (g_icon_scale_mode == WM_ICON_SCALE_BILINEAR) {
+                if (!bmp_scale_bilinear_rgb32(px, w, h, &scaled, target_px, target_px)) continue;
+            } else {
+                if (!bmp_scale_nearest_rgb32(px, w, h, &scaled, target_px, target_px)) continue;
+            }
         }
 
-        e->px16 = scaled;
-        return e->px16;
+        e->px_scaled = scaled;
+        e->scaled_w = target_px;
+        e->scaled_h = target_px;
+        return e->px_scaled;
     }
 
     return NULL;
@@ -692,6 +783,12 @@ void wm_init(void) {
         kmem_memset(g_backbuf, 0, bytes);
     }
 
+}
+
+void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode) {
+    g_icon_scale_mode = mode;
+    kmem_memset(g_icon_cache, 0, sizeof(g_icon_cache));
+    wm_mark_dirty();
 }
 
 wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_px) {
@@ -1006,19 +1103,36 @@ static void handle_click_start_menu(int x, int y) {
         return;
     }
 
-    int yy = y0 + 10;
+    int pad = 10;
+    int content_w = menu_w - pad * 2;
+    int content_h = menu_h - pad * 2;
+    int cell_h = ICON_DRAW_PX + 16 + 6;
+    if (cell_h < ICON_DRAW_PX + 8) cell_h = ICON_DRAW_PX + 8;
+    int cols = content_w / (ICON_DRAW_PX + 12);
+    if (cols < 1) cols = 1;
+    int cell_w = content_w / cols;
+    if (cell_w < ICON_DRAW_PX) cell_w = ICON_DRAW_PX;
+    int rows = content_h / cell_h;
+    if (rows < 1) rows = 1;
+
     int count = 0;
     const mljos_app_descriptor_t *apps = apps_registry_list(&count);
+    int col = 0;
+    int row = 0;
     for (int i = 0; i < count; ++i) {
         if (!apps[i].supports_ui) continue;
-        if (rect_contains(x, y, x0 + 6, yy - 2, menu_w - 12, 18)) {
+        int cell_x = x0 + pad + col * cell_w;
+        int cell_y = y0 + pad + row * cell_h;
+        if (cell_y + cell_h > y0 + menu_h - pad) break;
+        if (rect_contains(x, y, cell_x, cell_y, cell_w, cell_h)) {
             g_start_open = 0;
             wm_mark_dirty();
             set_launch_req(apps[i].name);
             return;
         }
-        yy += 22;
-        if (yy > y0 + menu_h - 24) break;
+        col++;
+        if (col >= cols) { col = 0; row++; }
+        if (row >= rows) break;
     }
 }
 
