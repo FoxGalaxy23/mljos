@@ -4,7 +4,7 @@
 MLJOS_APP_DEFINE("Editor", MLJOS_APP_FLAG_TUI);
 
 #define MAX_LINES 128
-#define MAX_COLS 80
+#define MAX_COLS 256
 
 static char lines[MAX_LINES][MAX_COLS];
 static int line_lens[MAX_LINES];
@@ -17,6 +17,8 @@ static char temporary_msg[128];
 /* Forward declarations so that _start is the very first compiled function */
 static int copy_str(char *dst, const char *src, int maxlen);
 static int text_len(const char *text);
+static int view_cols(mljos_api_t *api);
+static int view_rows(mljos_api_t *api);
 static void draw_status(mljos_api_t *api);
 static void draw_screen(mljos_api_t *api);
 static void prompt_save(mljos_api_t *api);
@@ -78,7 +80,13 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     draw_screen(api);
 
     while (1) {
-        api->set_cursor(cy - scroll_y, cx);
+        {
+            int cols = view_cols(api);
+            int cur_col = cx;
+            if (cols > 0 && cur_col >= cols) cur_col = cols - 1;
+            if (cur_col < 0) cur_col = 0;
+            api->set_cursor(cy - scroll_y, cur_col);
+        }
         int key = api->read_key();
 
         if (key == 24) { // Ctrl+X
@@ -95,7 +103,11 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
             if (cy < num_lines - 1) {
                 cy++;
                 if (cx > line_lens[cy]) cx = line_lens[cy];
-                if (cy >= scroll_y + 24) { scroll_y = cy - 23; draw_screen(api); }
+                {
+                    int rows = view_rows(api);
+                    int text_rows = rows > 1 ? rows - 1 : 1;
+                    if (cy >= scroll_y + text_rows) { scroll_y = cy - (text_rows - 1); draw_screen(api); }
+                }
             }
         } else if (key == 1002) { // LEFT
             if (cx > 0) {
@@ -111,7 +123,11 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
             } else if (cy < num_lines - 1) {
                 cy++;
                 cx = 0;
-                if (cy >= scroll_y + 24) { scroll_y = cy - 23; draw_screen(api); }
+                {
+                    int rows = view_rows(api);
+                    int text_rows = rows > 1 ? rows - 1 : 1;
+                    if (cy >= scroll_y + text_rows) { scroll_y = cy - (text_rows - 1); draw_screen(api); }
+                }
             }
         } else if (key == '\n') { // ENTER
             if (num_lines < MAX_LINES) {
@@ -128,7 +144,11 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
                 num_lines++;
                 cy++;
                 cx = 0;
-                if (cy >= scroll_y + 24) scroll_y = cy - 23;
+                {
+                    int rows = view_rows(api);
+                    int text_rows = rows > 1 ? rows - 1 : 1;
+                    if (cy >= scroll_y + text_rows) scroll_y = cy - (text_rows - 1);
+                }
                 draw_screen(api);
             }
         } else if (key == 8) { // BACKSPACE
@@ -192,45 +212,69 @@ static int text_len(const char *text) {
     return len;
 }
 
+static int view_cols(mljos_api_t *api) {
+    if (api && api->tui_cols) {
+        int cols = api->tui_cols();
+        if (cols > 0) return cols;
+    }
+    return 80;
+}
+
+static int view_rows(mljos_api_t *api) {
+    if (api && api->tui_rows) {
+        int rows = api->tui_rows();
+        if (rows > 0) return rows;
+    }
+    return 25;
+}
+
 static void draw_status(mljos_api_t *api) {
-    for (int i = 0; i < MAX_COLS; i++) {
-        api->putchar_at(' ', 24, i);
+    int cols = view_cols(api);
+    int rows = view_rows(api);
+    int status_row = rows > 0 ? rows - 1 : 0;
+
+    for (int i = 0; i < cols; i++) {
+        api->putchar_at(' ', status_row, i);
     }
     
     if (temporary_msg[0]) {
         int i = 0;
-        for (; temporary_msg[i] && i < MAX_COLS; i++) {
-            api->putchar_at(temporary_msg[i], 24, i);
+        for (; temporary_msg[i] && i < cols; i++) {
+            api->putchar_at(temporary_msg[i], status_row, i);
         }
         temporary_msg[0] = '\0';
         return;
     }
 
-    char status[80];
+    char status[256];
     int pos = 0;
 
     const char *title = "mljOS Edit - ";
-    while (*title && pos < 79) status[pos++] = *title++;
+    while (*title && pos < (int)sizeof(status) - 1) status[pos++] = *title++;
     
     char *fn = filename[0] ? filename : "(new file)";
-    while (*fn && pos < 79) status[pos++] = *fn++;
+    while (*fn && pos < (int)sizeof(status) - 1) status[pos++] = *fn++;
     
     const char *cmds = " - Ctrl+O Save - Ctrl+X Exit";
-    while (*cmds && pos < 79) status[pos++] = *cmds++;
+    while (*cmds && pos < (int)sizeof(status) - 1) status[pos++] = *cmds++;
     
     status[pos] = '\0';
     
-    for (int i = 0; i < pos; i++) {
-        api->putchar_at(status[i], 24, i);
+    for (int i = 0; i < pos && i < cols; i++) {
+        api->putchar_at(status[i], status_row, i);
     }
 }
 
 static void draw_screen(mljos_api_t *api) {
+    int cols = view_cols(api);
+    int rows = view_rows(api);
+    int text_rows = rows > 1 ? rows - 1 : 1;
+
     api->clear_screen();
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < text_rows; i++) {
         int l = scroll_y + i;
         if (l < num_lines) {
-            for (int j = 0; j < line_lens[l]; j++) {
+            for (int j = 0; j < line_lens[l] && j < cols; j++) {
                 api->putchar_at(lines[l][j], i, j);
             }
         }
@@ -239,11 +283,20 @@ static void draw_screen(mljos_api_t *api) {
 }
 
 static void prompt_save(mljos_api_t *api) {
-    for (int i = 0; i < MAX_COLS; i++) api->putchar_at(' ', 24, i);
+    int cols = view_cols(api);
+    int rows = view_rows(api);
+    int status_row = rows > 0 ? rows - 1 : 0;
+
+    for (int i = 0; i < cols; i++) api->putchar_at(' ', status_row, i);
     const char *p = filename[0] ? "Save to (empty = current): " : "Save to: ";
-    for (int i = 0; p[i]; i++) api->putchar_at(p[i], 24, i);
+    for (int i = 0; p[i] && i < cols; i++) api->putchar_at(p[i], status_row, i);
     
-    api->set_cursor(24, text_len(p));
+    {
+        int col = text_len(p);
+        if (cols > 0 && col >= cols) col = cols - 1;
+        if (col < 0) col = 0;
+        api->set_cursor(status_row, col);
+    }
     
     char new_name[128];
     int len = api->read_line(new_name, sizeof(new_name));

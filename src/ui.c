@@ -73,6 +73,50 @@ static void ui_draw_text_impl(const char *s, int x, int y, uint32_t rgb) {
     wm_mark_dirty();
 }
 
+static void ui_draw_text_scale_impl(const char *s, int x, int y, uint32_t rgb, int scale) {
+    if (scale <= 1) {
+        ui_draw_text_impl(s, x, y, rgb);
+        return;
+    }
+
+    task_t *t = task_current();
+    if (!t || !t->window) return;
+    uint32_t *px = wm_window_client_pixels(t->window);
+    int cw = wm_window_client_w(t->window);
+    int ch = wm_window_client_h(t->window);
+    uint32_t pitch = wm_window_client_pitch_bytes(t->window);
+    if (!px || cw <= 0 || ch <= 0 || !s) return;
+
+    int xx = x;
+    for (int i = 0; s[i]; ++i) {
+        char chh = s[i];
+        const uint8_t *glyph = font8x16[(uint8_t)chh];
+        for (int gy = 0; gy < 16; ++gy) {
+            uint8_t bits = glyph[gy];
+            int py0 = y + gy * scale;
+            int py1 = py0 + scale;
+            if (py1 <= 0 || py0 >= ch) continue;
+            for (int gx = 0; gx < 8; ++gx) {
+                if (!(bits & (1u << (7 - gx)))) continue;
+                int px0 = xx + gx * scale;
+                int px1 = px0 + scale;
+                if (px1 <= 0 || px0 >= cw) continue;
+                int sy0 = py0 < 0 ? 0 : py0;
+                int sy1 = py1 > ch ? ch : py1;
+                int sx0 = px0 < 0 ? 0 : px0;
+                int sx1 = px1 > cw ? cw : px1;
+                for (int yy = sy0; yy < sy1; ++yy) {
+                    uint32_t *row = (uint32_t *)((uintptr_t)px + (uintptr_t)yy * pitch);
+                    for (int xx2 = sx0; xx2 < sx1; ++xx2) row[xx2] = rgb;
+                }
+            }
+        }
+        xx += 8 * scale;
+        if (xx >= cw) break;
+    }
+    wm_mark_dirty();
+}
+
 static void ui_begin_app_impl(const char *title) {
     task_t *t = task_current();
     if (t && t->window && title) wm_window_set_title(t->window, title);
@@ -100,6 +144,7 @@ static mljos_ui_api_t g_ui_api = {
     .screen_h = ui_screen_h_impl,
     .fill_rect = ui_fill_rect_impl,
     .draw_text = ui_draw_text_impl,
+    .draw_text_scale = ui_draw_text_scale_impl,
     .begin_app = ui_begin_app_impl,
     .end_app = ui_end_app_impl,
     .poll_event = ui_poll_event_impl,

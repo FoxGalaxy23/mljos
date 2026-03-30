@@ -29,6 +29,8 @@ typedef struct {
     uint32_t (*screen_h)(void);
     void (*fill_rect)(int x, int y, int w, int h, uint32_t rgb);
     void (*draw_text)(const char *s, int x, int y, uint32_t rgb);
+    // Scaled bitmap text (scale >= 1). Optional; may be NULL on older runtimes.
+    void (*draw_text_scale)(const char *s, int x, int y, uint32_t rgb, int scale);
 
     // App lifecycle (modal/fullscreen)
     void (*begin_app)(const char *title);
@@ -47,6 +49,9 @@ typedef struct {
     int (*write_file)(const char *path, const char *buf, unsigned int size);
     void (*set_cursor)(int row, int col);
     void (*putchar_at)(char ch, int row, int col);
+    // Current TUI size in character cells (per-task console).
+    int (*tui_cols)(void);
+    int (*tui_rows)(void);
     int (*read_key)(void);
     int (*list_dir)(const char *path, char *out, int out_size);
     int (*get_cwd)(char *out, int out_size);

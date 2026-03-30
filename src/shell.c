@@ -18,6 +18,8 @@ static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *
 static int app_write_file(const char *path, const char *buf, unsigned int size);
 static void os_set_cursor(int row, int col);
 static void os_putchar_at(char ch, int row, int col);
+static int os_tui_cols(void);
+static int os_tui_rows(void);
 static int os_read_key(void);
 static int os_list_dir(const char *path, char *out, int out_size);
 static int os_get_cwd(char *out, int out_size);
@@ -81,6 +83,8 @@ mljos_api_t os_api = {
     .write_file = app_write_file,
     .set_cursor = os_set_cursor,
     .putchar_at = os_putchar_at,
+    .tui_cols = os_tui_cols,
+    .tui_rows = os_tui_rows,
     .read_key = os_read_key,
     .list_dir = os_list_dir,
     .get_cwd = os_get_cwd,
@@ -156,6 +160,14 @@ static void os_set_cursor(int row, int col) {
 
 static void os_putchar_at(char ch, int row, int col) {
     putchar_at(ch, row, col);
+}
+
+static int os_tui_cols(void) {
+    return VGA_COLS;
+}
+
+static int os_tui_rows(void) {
+    return VGA_ROWS;
 }
 
 static int os_read_key(void) {
