@@ -46,11 +46,19 @@ The helper script for QEMU also uses:
 - `qemu-kvm`
 - `qemu-utils`
 
-## Build
+## Building mljOS if you using Ubuntu or Debian like distros
 
 ```bash
 chmod +x build.sh
 ./build.sh
+```
+
+
+## Building mljOS if you using Windows 10/11
+You need install activated WSL 2.0 and already installed Ubuntu WSL from Winget or Microslop Store
+```PowerShell
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+./build.ps1
 ```
 
 Build output will appear in `build/`:
