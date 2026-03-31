@@ -27,6 +27,8 @@ static int os_mkdir(const char *path);
 static int os_rm(const char *path);
 static void os_get_time(uint8_t *h, uint8_t *m, uint8_t *s);
 static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y);
+static int os_launch_app(const char *name_or_path);
+static int os_launch_app_args(const char *name_or_path, const char *open_path);
 
 typedef enum storage_target {
     STORAGE_RAM = 0,
@@ -94,6 +96,8 @@ mljos_api_t os_api = {
     .get_date = os_get_date,
     .open_path = g_kernel_open_path,
     .run_shell = shell_run,
+    .launch_app = os_launch_app,
+    .launch_app_args = os_launch_app_args,
     .launch_flags = 0,
     .ui = NULL,
 };
@@ -261,6 +265,15 @@ static void os_get_time(uint8_t *h, uint8_t *m, uint8_t *s) {
 
 static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y) {
     get_rtc_date(d, mo, y);
+}
+
+static int os_launch_app(const char *name_or_path) {
+    // Currently relying on the GUI launcher for all async launches
+    return launcher_launch_gui(name_or_path);
+}
+
+static int os_launch_app_args(const char *name_or_path, const char *open_path) {
+    return launcher_launch_gui_args(name_or_path, open_path);
 }
 
 // Shell history is per-task; stored in task_t fields.

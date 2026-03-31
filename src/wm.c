@@ -906,6 +906,82 @@ int wm_consume_launch_request(char *out_name, int out_size) {
     return 1;
 }
 
+static int text_len(const char *s) {
+    int i = 0;
+    while (s && s[i]) i++;
+    return i;
+}
+
+int wm_prompt_input(const char *title, const char *prompt, char *out_buf, int max_len) {
+    if (!title) title = "Input";
+    if (!prompt) prompt = "Enter text:";
+    
+    // Create a real child window for the dialog
+    wm_window_t *w = wm_window_create(title, 340, 130);
+    if (!w) return 0;
+    
+    // Attach to the current task so it feels like the application's window
+    task_t *owner = task_current();
+    if (owner) wm_window_set_owner(w, owner);
+    
+    wm_window_focus(w);
+    
+    out_buf[0] = '\0';
+    int done = 0;
+    int status = 0;
+    
+    while (!done) {
+        mljos_ui_event_t ev;
+        while (wm_window_poll_event(w, &ev)) {
+            if (ev.type == MLJOS_UI_EVENT_KEY_DOWN) {
+                if (ev.key == '\n' || ev.key == '\r') {
+                    status = 1;
+                    done = 1;
+                } else if (ev.key == 27) {
+                    status = 0;
+                    done = 1;
+                } else if (ev.key == '\b') {
+                    int l = text_len(out_buf);
+                    if (l > 0) out_buf[l - 1] = '\0';
+                } else if (ev.key >= 32 && ev.key <= 126) {
+                    int l = text_len(out_buf);
+                    if (l < max_len - 1) {
+                        out_buf[l] = (char)ev.key;
+                        out_buf[l + 1] = '\0';
+                    }
+                }
+            }
+        }
+        
+        if (w->close_requested) {
+            status = 0;
+            done = 1;
+        }
+        
+        // Render the dialog content into the client canvas
+        if (w->client_px) {
+            fill_rect(w->client_px, w->client_pitch, w->client_w, w->client_h, 0, 0, w->client_w, w->client_h, 0x1E1E1E);
+            draw_text(w->client_px, w->client_pitch, w->client_w, w->client_h, prompt, 15, 20, 0xCCCCCC);
+            
+            fill_rect(w->client_px, w->client_pitch, w->client_w, w->client_h, 15, 55, w->client_w - 30, 24, 0x0E0E0E);
+            draw_text(w->client_px, w->client_pitch, w->client_w, w->client_h, out_buf, 20, 60, 0xFFFFFF);
+            int cursor_x = 20 + text_len(out_buf) * 8;
+            draw_text(w->client_px, w->client_pitch, w->client_w, w->client_h, "_", cursor_x, 60, 0xFFFFFF);
+            
+            draw_text(w->client_px, w->client_pitch, w->client_w, w->client_h, "[Enter] OK     [Esc] Cancel", 65, 100, 0x888888);
+            
+            win_post_expose(w);
+            wm_mark_dirty();
+        }
+        
+        task_yield();
+    }
+    
+    wm_window_destroy(w);
+    wm_mark_dirty();
+    return status;
+}
+
 static void set_launch_req(const char *name) {
     if (!name || !name[0]) return;
     int i = 0;
@@ -1012,7 +1088,6 @@ static void mouse_push_byte(uint8_t b) {
     if (g_mouse_y >= sh) g_mouse_y = sh - 1;
 
     int left = (b0 & 1) ? 1 : 0;
-    g_mouse_left_prev = g_mouse_left;
     g_mouse_left = left;
     wm_mark_dirty();
 }
@@ -1279,7 +1354,9 @@ void wm_pump_input(void) {
             mouse_push_byte(data);
         } else {
             int key = kbd_scancode_to_key(data);
-            if (key && g_focused) win_post_key(g_focused, key);
+            if (key && g_focused) {
+                win_post_key(g_focused, key);
+            }
         }
     }
 
@@ -1287,6 +1364,8 @@ void wm_pump_input(void) {
     if (g_mouse_left && !g_mouse_left_prev) handle_mouse_down();
     if (!g_mouse_left && g_mouse_left_prev) handle_mouse_up();
     handle_mouse_move();
+    
+    g_mouse_left_prev = g_mouse_left;
 }
 
 void wm_compose_if_dirty(void) {

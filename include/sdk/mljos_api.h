@@ -38,6 +38,9 @@ typedef struct {
 
     // Input (non-blocking; returns 1 if event written)
     int (*poll_event)(mljos_ui_event_t *out_event);
+    
+    // System Dialogs (blocking kernel overlay)
+    int (*prompt_input)(const char *title, const char *prompt, char *out_buf, int max_len);
 } mljos_ui_api_t;
 
 typedef struct {
@@ -62,6 +65,10 @@ typedef struct {
     const char *open_path; // Optional: path to open on app startup (edit, etc.)
     // Optional: run the built-in shell within the current task/window.
     void (*run_shell)(void);
+    // Launch an executable application asynchronously by name or path
+    int (*launch_app)(const char *name_or_path);
+    // Launch an executable application asynchronously and set its open_path
+    int (*launch_app_args)(const char *name_or_path, const char *open_path);
 
     // GUI mode / graphics (optional)
     uint32_t launch_flags;   // MLJOS_LAUNCH_*

@@ -139,6 +139,10 @@ static int ui_poll_event_impl(mljos_ui_event_t *out_event) {
     return 0;
 }
 
+static int ui_prompt_input_impl(const char *title, const char *prompt, char *out_buf, int max_len) {
+    return wm_prompt_input(title, prompt, out_buf, max_len);
+}
+
 static mljos_ui_api_t g_ui_api = {
     .screen_w = ui_screen_w_impl,
     .screen_h = ui_screen_h_impl,
@@ -148,6 +152,7 @@ static mljos_ui_api_t g_ui_api = {
     .begin_app = ui_begin_app_impl,
     .end_app = ui_end_app_impl,
     .poll_event = ui_poll_event_impl,
+    .prompt_input = ui_prompt_input_impl,
 };
 
 mljos_ui_api_t *ui_api(void) {

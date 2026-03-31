@@ -35,7 +35,7 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
         }
         return;
     }
-    char *file_path = api->open_path;
+    const char *file_path = api->open_path;
     char *output_path = NULL;
 
     static char path_buf[128];

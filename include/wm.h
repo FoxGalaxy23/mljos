@@ -45,4 +45,7 @@ void wm_window_post_expose(wm_window_t *w);
 // Launcher request from Start menu
 int wm_consume_launch_request(char *out_name, int out_size);
 
+// System Dialog overlay (blocks until user interacts)
+int wm_prompt_input(const char *title, const char *prompt, char *out_buf, int max_len);
+
 #endif

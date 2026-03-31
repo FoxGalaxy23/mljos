@@ -53,6 +53,10 @@ static int load_app_image(const char *app_path, void **out_image, uint32_t *out_
 }
 
 int launcher_launch_gui(const char *name) {
+    return launcher_launch_gui_args(name, NULL);
+}
+
+int launcher_launch_gui_args(const char *name, const char *open_path) {
     if (!name || !name[0]) return 0;
 
     char app_path[128];
@@ -70,10 +74,18 @@ int launcher_launch_gui(const char *name) {
         wm_window_destroy(w);
         return 0;
     }
-
-    if (strcmp(name, "terminal") == 0) {
-        shell_init_task_api(t);
+    
+    if (open_path) {
+        int i = 0;
+        while (open_path[i] && i < (int)sizeof(t->shell_open_path) - 1) {
+            t->shell_open_path[i] = open_path[i];
+            i++;
+        }
+        t->shell_open_path[i] = '\0';
     }
+
+    // Initialize full system API for the app
+    shell_init_task_api(t);
 
     fill_minimal_gui_api(&t->api);
 
