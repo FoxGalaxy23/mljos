@@ -714,10 +714,11 @@ static uint32_t *wm_get_app_icon_scaled(const char *app_name, int target_px) {
     if (!e) return NULL;
     if (e->loaded && e->scaled_w == target_px && e->scaled_h == target_px && e->scaled_mode == g_icon_scale_mode) return e->px_scaled;
 
-    e->loaded = 1; // mark as attempted
+    // Mark as attempted for this size/mode to avoid reloading missing icons every frame.
+    e->loaded = 1;
     e->px_scaled = NULL;
-    e->scaled_w = 0;
-    e->scaled_h = 0;
+    e->scaled_w = target_px;
+    e->scaled_h = target_px;
     e->scaled_mode = g_icon_scale_mode;
 
     const char *prefixes[] = {
