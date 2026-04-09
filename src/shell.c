@@ -377,6 +377,48 @@ static void cmd_reboot(void) {
     }
 }
 
+static void cmd_gui(const char *arg) {
+    int enable = -1;
+
+    if (!arg || !arg[0]) {
+        enable = wm_gui_enabled() ? 0 : 1;
+    } else if (strcmp(arg, "on") == 0 || strcmp(arg, "enable") == 0 || strcmp(arg, "1") == 0) {
+        enable = 1;
+    } else if (strcmp(arg, "off") == 0 || strcmp(arg, "disable") == 0 || strcmp(arg, "0") == 0) {
+        enable = 0;
+    } else {
+        puts("gui: usage gui [on|off]\n");
+        return;
+    }
+
+    wm_set_gui_enabled(enable);
+
+    if (enable) {
+        wm_window_t *w = wm_terminal_window();
+        if (w) {
+            console_bind_target(
+                NULL,
+                wm_window_client_pixels(w),
+                (uint32_t)wm_window_client_w(w),
+                (uint32_t)wm_window_client_h(w),
+                wm_window_client_pitch_bytes(w)
+            );
+            console_set_visible(NULL, 1);
+            console_redraw(NULL);
+            wm_window_focus(w);
+        }
+        wm_mark_dirty();
+        puts("gui: enabled\n");
+        return;
+    }
+
+    console_bind_screen();
+    console_set_visible(NULL, 1);
+    console_redraw(NULL);
+    wm_mark_dirty();
+    puts("gui: disabled\n");
+}
+
 static void cmd_shutdown(void) {
     uint8_t old_color = COLOR;
     COLOR = COLOR_ALERT;
@@ -694,7 +736,7 @@ static void print_storage_help(void) {
     puts("Apps: bundled apps are stored in /apps and can be launched by name, like calc or edit\n");
     puts("Apps (GUI): `open <app>` launches the app in a window (if it supports GUI)\n");
     puts("Editor: `edit [path]` opens a file in the built-in editor\n");
-    puts("System: install, exec <app|path>, usb, clear, help, shutdown, reboot\n");
+    puts("System: install, exec <app|path>, usb, gui [on|off], clear, help, shutdown, reboot\n");
     puts("Scripts: .scri in /system/autorun run on boot (run by typing file name)\n");
     print_usb_help();
 }
@@ -1200,6 +1242,8 @@ static void handle_command(char *line) {
         cmd_echo(joined);
     } else if (strcmp(argv[0], "reboot") == 0) {
         cmd_reboot();
+    } else if (strcmp(argv[0], "gui") == 0) {
+        cmd_gui(argc > 1 ? argv[1] : NULL);
     } else if (strcmp(argv[0], "shutdown") == 0) {
         cmd_shutdown();
     } else if (strcmp(argv[0], "clear") == 0) {
@@ -1376,7 +1420,7 @@ static void handle_command(char *line) {
             }
         }
     } else if (strcmp(argv[0], "help") == 0) {
-        puts("Commands: time, date, echo, shutdown, reboot, clear, help\n");
+        puts("Commands: time, date, echo, gui, shutdown, reboot, clear, help\n");
         print_storage_help();
     } else if (strcmp(argv[0], "usb") == 0) {
         if (argc == 1 || strcmp(argv[1], "controllers") == 0 || strcmp(argv[1], "list") == 0) {

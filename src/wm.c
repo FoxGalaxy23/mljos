@@ -80,6 +80,7 @@ static int g_dirty = 1;
 static int g_start_open = 0;
 static char g_launch_req[32];
 static int g_has_launch_req = 0;
+static int g_gui_enabled = 1;
 
 // Mouse
 static int g_mouse_x = 10;
@@ -768,6 +769,7 @@ void wm_init(void) {
     g_has_launch_req = 0;
     g_drag_mode = DRAG_NONE;
     g_drag_win = NULL;
+    g_gui_enabled = 1;
     g_dirty = 1;
     z_rebuild();
 
@@ -788,6 +790,18 @@ void wm_init(void) {
 void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode) {
     g_icon_scale_mode = mode;
     kmem_memset(g_icon_cache, 0, sizeof(g_icon_cache));
+    wm_mark_dirty();
+}
+
+int wm_gui_enabled(void) {
+    return g_gui_enabled ? 1 : 0;
+}
+
+void wm_set_gui_enabled(int enabled) {
+    int v = enabled ? 1 : 0;
+    if (g_gui_enabled == v) return;
+    g_gui_enabled = v;
+    if (!g_gui_enabled) g_start_open = 0;
     wm_mark_dirty();
 }
 
@@ -1371,6 +1385,10 @@ void wm_pump_input(void) {
 void wm_compose_if_dirty(void) {
     if (!g_dirty) return;
     if (!fb_root.address) return;
+    if (!g_gui_enabled) {
+        g_dirty = 0;
+        return;
+    }
 
     wm_try_load_wallpaper();
 

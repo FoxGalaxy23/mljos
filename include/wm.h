@@ -18,6 +18,10 @@ void wm_compose_if_dirty(void);
 void wm_mark_dirty(void);
 void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode);
 
+// GUI enable/disable (console-only mode)
+int wm_gui_enabled(void);
+void wm_set_gui_enabled(int enabled);
+
 // Window lifecycle
 wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_px);
 void wm_window_destroy(wm_window_t *w);
