@@ -17,6 +17,7 @@ void wm_pump_input(void);
 void wm_compose_if_dirty(void);
 void wm_mark_dirty(void);
 void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode);
+void wm_on_resolution_change(void);
 
 // GUI enable/disable (console-only mode)
 int wm_gui_enabled(void);

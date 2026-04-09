@@ -29,6 +29,9 @@ static void os_get_time(uint8_t *h, uint8_t *m, uint8_t *s);
 static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y);
 static int os_launch_app(const char *name_or_path);
 static int os_launch_app_args(const char *name_or_path, const char *open_path);
+static int parse_decimal_number(const char *text, int *value_out);
+static int parse_resolution_text(const char *text, int *w_out, int *h_out);
+static void print_uint(uint32_t value);
 
 typedef enum storage_target {
     STORAGE_RAM = 0,
@@ -419,6 +422,95 @@ static void cmd_gui(const char *arg) {
     puts("gui: disabled\n");
 }
 
+static void cmd_resolution(char **argv, int argc) {
+    struct res_opt { int w; int h; };
+    static const struct res_opt presets[] = {
+        {800, 600},
+        {1024, 768},
+        {1280, 720},
+        {19880, 1080}
+    };
+
+    int w = 0;
+    int h = 0;
+
+    if (argc < 2) {
+        puts("resolution: choose preset or type WxH\n");
+        puts("  1) 800x600\n");
+        puts("  2) 1024x768\n");
+        puts("  3) 1280x720\n");
+        puts("  4) 19880x1080\n");
+        puts("select (1-4) or enter WxH: ");
+        char line[32];
+        read_line(line, sizeof(line));
+
+        int idx = 0;
+        if (parse_decimal_number(line, &idx)) {
+            if (idx < 1 || idx > (int)(sizeof(presets) / sizeof(presets[0]))) {
+                puts("resolution: invalid preset\n");
+                return;
+            }
+            w = presets[idx - 1].w;
+            h = presets[idx - 1].h;
+        } else if (!parse_resolution_text(line, &w, &h)) {
+            puts("resolution: use 800x600 or 1-4\n");
+            return;
+        }
+    } else if (strcmp(argv[1], "list") == 0) {
+        puts("resolution presets: 800x600, 1024x768, 1280x720, 19880x1080\n");
+        uint32_t cw = 0, ch = 0, mw = 0, mh = 0;
+        console_get_screen_size(&cw, &ch);
+        console_get_max_screen_size(&mw, &mh);
+        puts("current: ");
+        print_uint(cw);
+        putchar('x');
+        print_uint(ch);
+        putchar('\n');
+        puts("max: ");
+        print_uint(mw);
+        putchar('x');
+        print_uint(mh);
+        putchar('\n');
+        return;
+    } else {
+        int idx = 0;
+        if (parse_decimal_number(argv[1], &idx)) {
+            if (idx < 1 || idx > (int)(sizeof(presets) / sizeof(presets[0]))) {
+                puts("resolution: invalid preset\n");
+                return;
+            }
+            w = presets[idx - 1].w;
+            h = presets[idx - 1].h;
+        } else if (!parse_resolution_text(argv[1], &w, &h)) {
+            puts("resolution: use 800x600 or 1-4\n");
+            return;
+        }
+    }
+
+    if (!console_set_screen_size((uint32_t)w, (uint32_t)h)) {
+        uint32_t mw = 0, mh = 0;
+        console_get_max_screen_size(&mw, &mh);
+        puts("resolution: not supported by current framebuffer (max ");
+        print_uint(mw);
+        putchar('x');
+        print_uint(mh);
+        puts(")\n");
+        return;
+    }
+    wm_on_resolution_change();
+    if (!wm_gui_enabled()) {
+        console_bind_screen();
+        console_set_visible(NULL, 1);
+        console_redraw(NULL);
+    }
+
+    puts("resolution: set to ");
+    print_uint((uint32_t)w);
+    putchar('x');
+    print_uint((uint32_t)h);
+    putchar('\n');
+}
+
 static void cmd_shutdown(void) {
     uint8_t old_color = COLOR;
     COLOR = COLOR_ALERT;
@@ -704,6 +796,50 @@ static int parse_decimal_number(const char *text, int *value_out) {
     return 1;
 }
 
+static void print_uint(uint32_t value) {
+    char buf[16];
+    int pos = 0;
+
+    if (value == 0) {
+        putchar('0');
+        return;
+    }
+
+    while (value > 0 && pos < 15) {
+        buf[pos++] = (char)('0' + (value % 10));
+        value /= 10;
+    }
+
+    while (pos > 0) putchar(buf[--pos]);
+}
+
+static int parse_resolution_text(const char *text, int *w_out, int *h_out) {
+    if (!text || !text[0] || !w_out || !h_out) return 0;
+    int i = 0;
+    while (text[i] && text[i] != 'x' && text[i] != 'X') i++;
+    if (!text[i]) return 0;
+
+    char wbuf[8];
+    char hbuf[8];
+    int wi = 0;
+    int hi = 0;
+
+    for (int j = 0; j < i && wi < (int)sizeof(wbuf) - 1; j++) {
+        wbuf[wi++] = text[j];
+    }
+    wbuf[wi] = '\0';
+
+    for (int j = i + 1; text[j] && hi < (int)sizeof(hbuf) - 1; j++) {
+        hbuf[hi++] = text[j];
+    }
+    hbuf[hi] = '\0';
+
+    if (!parse_decimal_number(wbuf, w_out)) return 0;
+    if (!parse_decimal_number(hbuf, h_out)) return 0;
+    if (*w_out <= 0 || *h_out <= 0) return 0;
+    return 1;
+}
+
 static void print_usb_help(void) {
     puts("USB: usb, usb controllers, usb ports <controller>, usb reset <controller> <port>, usb probe <controller> <port>, usb storage <controller> <port>, usb read <controller> <port> [lba]\n");
 }
@@ -736,7 +872,7 @@ static void print_storage_help(void) {
     puts("Apps: bundled apps are stored in /apps and can be launched by name, like calc or edit\n");
     puts("Apps (GUI): `open <app>` launches the app in a window (if it supports GUI)\n");
     puts("Editor: `edit [path]` opens a file in the built-in editor\n");
-    puts("System: install, exec <app|path>, usb, gui [on|off], clear, help, shutdown, reboot\n");
+    puts("System: install, exec <app|path>, usb, gui [on|off], resolution [WxH|list], clear, help, shutdown, reboot\n");
     puts("Scripts: .scri in /system/autorun run on boot (run by typing file name)\n");
     print_usb_help();
 }
@@ -1244,6 +1380,8 @@ static void handle_command(char *line) {
         cmd_reboot();
     } else if (strcmp(argv[0], "gui") == 0) {
         cmd_gui(argc > 1 ? argv[1] : NULL);
+    } else if (strcmp(argv[0], "resolution") == 0) {
+        cmd_resolution(argv, argc);
     } else if (strcmp(argv[0], "shutdown") == 0) {
         cmd_shutdown();
     } else if (strcmp(argv[0], "clear") == 0) {
@@ -1420,7 +1558,7 @@ static void handle_command(char *line) {
             }
         }
     } else if (strcmp(argv[0], "help") == 0) {
-        puts("Commands: time, date, echo, gui, shutdown, reboot, clear, help\n");
+        puts("Commands: time, date, echo, gui, resolution, shutdown, reboot, clear, help\n");
         print_storage_help();
     } else if (strcmp(argv[0], "usb") == 0) {
         if (argc == 1 || strcmp(argv[1], "controllers") == 0 || strcmp(argv[1], "list") == 0) {

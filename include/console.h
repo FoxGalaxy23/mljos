@@ -37,6 +37,11 @@ int *console_cursor_col_ptr(void);
 
 void console_init(uint32_t *addr, uint32_t w, uint32_t h, uint32_t p);
 console_t *console_create(void);
+// Updates the logical screen size (in pixels) within the physical framebuffer.
+// Returns 1 on success, 0 if the requested size is not supported.
+int console_set_screen_size(uint32_t w, uint32_t h);
+void console_get_screen_size(uint32_t *w, uint32_t *h);
+void console_get_max_screen_size(uint32_t *w, uint32_t *h);
 // Binds console rendering to an arbitrary framebuffer (e.g. a window backbuffer).
 // This does NOT change `fb_root` (physical screen); only the console target changes.
 void console_bind_target(console_t *c, uint32_t *addr, uint32_t w, uint32_t h, uint32_t pitch);

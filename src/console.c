@@ -5,6 +5,8 @@
 #include "wm.h"
 
 struct framebuffer fb_root;
+static uint32_t g_fb_root_max_w = 0;
+static uint32_t g_fb_root_max_h = 0;
 
 // Active console buffer size in character cells (подбирается под типичные framebuffer в QEMU).
 #define CONSOLE_MAX_COLS 256
@@ -113,6 +115,8 @@ void console_init(uint32_t *addr, uint32_t w, uint32_t h, uint32_t p) {
     uint32_t rows = clamp_cells_rows(h / (uint32_t)CHAR_HEIGHT);
     fb_root.width = cols * (uint32_t)CHAR_WIDTH;
     fb_root.height = rows * (uint32_t)CHAR_HEIGHT;
+    g_fb_root_max_w = fb_root.width;
+    g_fb_root_max_h = fb_root.height;
 
     kmem_memset(&g_kernel_console, 0, sizeof(g_kernel_console));
     g_kernel_console.target_root = fb_root;
@@ -126,6 +130,66 @@ void console_init(uint32_t *addr, uint32_t w, uint32_t h, uint32_t p) {
 
     buffer_clear_all_cells(&g_kernel_console, g_kernel_console.rows, g_kernel_console.cols);
     clear_screen();
+}
+
+int console_set_screen_size(uint32_t w, uint32_t h) {
+    if (!fb_root.address || w == 0 || h == 0) return 0;
+    if (g_fb_root_max_w == 0 || g_fb_root_max_h == 0) {
+        g_fb_root_max_w = fb_root.width;
+        g_fb_root_max_h = fb_root.height;
+    }
+
+    uint32_t max_cols = clamp_cells_cols(g_fb_root_max_w / (uint32_t)CHAR_WIDTH);
+    uint32_t max_rows = clamp_cells_rows(g_fb_root_max_h / (uint32_t)CHAR_HEIGHT);
+    if (max_cols == 0 || max_rows == 0) return 0;
+
+    uint32_t cols = clamp_cells_cols(w / (uint32_t)CHAR_WIDTH);
+    uint32_t rows = clamp_cells_rows(h / (uint32_t)CHAR_HEIGHT);
+    if (cols == 0 || rows == 0) return 0;
+    if (cols > max_cols || rows > max_rows) return 0;
+
+    fb_root.width = cols * (uint32_t)CHAR_WIDTH;
+    fb_root.height = rows * (uint32_t)CHAR_HEIGHT;
+
+    console_t *kc = &g_kernel_console;
+    if (kc->target_root.address == fb_root.address && kc->target_root.pitch == fb_root.pitch) {
+        kc->target_root = fb_root;
+        kc->viewport = kc->target_root;
+        buffer_resize_preserve(kc, rows, cols);
+        if ((uint32_t)kc->cursor_r >= kc->rows) kc->cursor_r = (int)kc->rows - 1;
+        if ((uint32_t)kc->cursor_c >= kc->cols) kc->cursor_c = (int)kc->cols - 1;
+        if (kc->rows == 0) kc->cursor_r = 0;
+        if (kc->cols == 0) kc->cursor_c = 0;
+        if (kc->visible) console_redraw(kc);
+    }
+
+    console_t *cur = console_current_impl();
+    if (cur && cur != kc && cur->target_root.address == fb_root.address && cur->target_root.pitch == fb_root.pitch) {
+        cur->target_root = fb_root;
+        cur->viewport = cur->target_root;
+        buffer_resize_preserve(cur, rows, cols);
+        if ((uint32_t)cur->cursor_r >= cur->rows) cur->cursor_r = (int)cur->rows - 1;
+        if ((uint32_t)cur->cursor_c >= cur->cols) cur->cursor_c = (int)cur->cols - 1;
+        if (cur->rows == 0) cur->cursor_r = 0;
+        if (cur->cols == 0) cur->cursor_c = 0;
+        if (cur->visible) console_redraw(cur);
+    }
+
+    return 1;
+}
+
+void console_get_screen_size(uint32_t *w, uint32_t *h) {
+    if (w) *w = fb_root.width;
+    if (h) *h = fb_root.height;
+}
+
+void console_get_max_screen_size(uint32_t *w, uint32_t *h) {
+    if (g_fb_root_max_w == 0 || g_fb_root_max_h == 0) {
+        g_fb_root_max_w = fb_root.width;
+        g_fb_root_max_h = fb_root.height;
+    }
+    if (w) *w = g_fb_root_max_w;
+    if (h) *h = g_fb_root_max_h;
 }
 
 void console_bind_target(console_t *c, uint32_t *addr, uint32_t w, uint32_t h, uint32_t pitch) {

@@ -205,6 +205,7 @@ static int g_resize_edges = 0; // bitmask: 1 left,2 right,4 top,8 bottom
 // Full-screen backbuffer to reduce flicker/tearing.
 static uint32_t *g_backbuf = NULL;
 static uint32_t g_back_pitch = 0;
+static uint64_t g_backbuf_bytes = 0;
 
 // Desktop wallpaper (scaled to screen, 0x00RRGGBB)
 static uint32_t *g_wallpaper = NULL;
@@ -783,9 +784,76 @@ void wm_init(void) {
         uint64_t bytes = (uint64_t)screen_w() * (uint64_t)screen_h() * 4ULL;
         g_backbuf = (uint32_t *)kmem_alloc(bytes, 16);
         g_back_pitch = (uint32_t)(screen_w() * 4);
+        g_backbuf_bytes = bytes;
         kmem_memset(g_backbuf, 0, bytes);
     }
 
+}
+
+void wm_on_resolution_change(void) {
+    int sw = (int)screen_w();
+    int sh = (int)screen_h();
+    if (sw <= 0 || sh <= 0) return;
+
+    // Reset wallpaper so it is reloaded and scaled to the new size.
+    g_wallpaper = NULL;
+    g_wallpaper_w = 0;
+    g_wallpaper_h = 0;
+
+    // Ensure backbuffer is large enough for the new size.
+    uint64_t bytes = (uint64_t)sw * (uint64_t)sh * 4ULL;
+    if (!g_backbuf || bytes > g_backbuf_bytes) {
+        g_backbuf = (uint32_t *)kmem_alloc(bytes, 16);
+        g_backbuf_bytes = bytes;
+    }
+    g_back_pitch = (uint32_t)(sw * 4);
+    if (g_backbuf) kmem_memset(g_backbuf, 0, bytes);
+
+    // Clamp mouse to new bounds.
+    if (g_mouse_x < 0) g_mouse_x = 0;
+    if (g_mouse_y < 0) g_mouse_y = 0;
+    if (g_mouse_x >= sw) g_mouse_x = sw - 1;
+    if (g_mouse_y >= sh) g_mouse_y = sh - 1;
+
+    int work_h = sh - TASKBAR_PX;
+    if (work_h < 1) work_h = 1;
+
+    for (int i = 0; i < WM_MAX_WINDOWS; ++i) {
+        wm_window_t *w = &g_windows[i];
+        if (!w->used) continue;
+
+        int max_w = sw;
+        int max_h = work_h;
+        if (max_w < 1) max_w = 1;
+        if (max_h < 1) max_h = 1;
+
+        if (w->maximized) {
+            w->x = 6;
+            w->y = 6;
+            w->w = sw - 12;
+            w->h = work_h - 12;
+        }
+
+        if (w->w > max_w) w->w = max_w;
+        if (w->h > max_h) w->h = max_h;
+
+        if (max_w >= 160 && w->w < 160) w->w = 160;
+        if (max_h >= 120 && w->h < 120) w->h = 120;
+        if (w->w < 1) w->w = 1;
+        if (w->h < 1) w->h = 1;
+
+        if (w->x + w->w > max_w) w->x = max_w - w->w;
+        if (w->y + w->h > max_h) w->y = max_h - w->h;
+        if (w->x < 0) w->x = 0;
+        if (w->y < 0) w->y = 0;
+
+        win_recompute_client(w);
+        win_ensure_backbuffer(w);
+        console_rebind_if_needed(w);
+        win_post_expose(w);
+    }
+
+    wm_mark_dirty();
 }
 
 void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode) {
