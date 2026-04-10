@@ -1164,6 +1164,7 @@ static const char scancode_map_shift[128] = {
 
 static int g_kbd_shift = 0;
 static int g_kbd_ctrl = 0;
+static int g_kbd_alt = 0;
 static int g_kbd_caps = 0;
 static int g_kbd_extended = 0;
 
@@ -1174,11 +1175,15 @@ static void kbd_handle_mod(uint8_t sc) {
         if (sc == 0xAA || sc == 0xB6) { g_kbd_shift = 0; return; }
         if (sc == 0x1D) { g_kbd_ctrl = 1; return; }
         if (sc == 0x9D) { g_kbd_ctrl = 0; return; }
+        if (sc == 0x38) { g_kbd_alt = 1; return; }
+        if (sc == 0xB8) { g_kbd_alt = 0; return; }
         if (sc == 0x3A) { g_kbd_caps = !g_kbd_caps; return; }
         return;
     }
     if (sc == 0x1D) { g_kbd_ctrl = 1; g_kbd_extended = 0; return; }
     if (sc == 0x9D) { g_kbd_ctrl = 0; g_kbd_extended = 0; return; }
+    if (sc == 0x38) { g_kbd_alt = 1; g_kbd_extended = 0; return; }
+    if (sc == 0xB8) { g_kbd_alt = 0; g_kbd_extended = 0; return; }
 }
 
 static int kbd_translate_arrow(uint8_t make, int extended) {
@@ -1621,7 +1626,26 @@ void wm_pump_input(void) {
             mouse_push_byte(data);
         } else {
             int key = kbd_scancode_to_key(data);
-            if (key && g_focused) {
+            if (g_kbd_alt && (data & 0x7F) == 0x0F && !(data & 0x80)) { // Alt+Tab
+                if (g_zcount > 1) {
+                    int next_idx = -1;
+                    for (int i = g_zcount - 2; i >= 0; --i) {
+                        if (g_windows[g_zorder[i]].used && !g_windows[g_zorder[i]].minimized) {
+                            next_idx = g_zorder[i];
+                            break;
+                        }
+                    }
+                    if (next_idx >= 0) {
+                        z_focus_index(next_idx);
+                        g_focused = &g_windows[next_idx];
+                        wm_mark_dirty();
+                    }
+                }
+            } else if (g_kbd_alt && (data & 0x7F) == 0x3E && !(data & 0x80)) { // Alt+F4
+                if (g_focused) {
+                    g_focused->close_requested = 1;
+                }
+            } else if (key && g_focused) {
                 win_post_key(g_focused, key);
             }
         }
