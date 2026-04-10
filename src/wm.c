@@ -87,8 +87,10 @@ static int g_mouse_x = 10;
 static int g_mouse_y = 10;
 static int g_mouse_left = 0;
 static int g_mouse_left_prev = 0;
-static uint8_t g_mouse_pkt[3];
+static uint8_t g_mouse_pkt[4];
 static int g_mouse_pkt_i = 0;
+static int g_mouse_pkt_bytes = 3;
+static int g_mouse_moved = 0;
 
 static void ps2_wait_input_empty(void) {
     while (inb(0x64) & 2) { }
@@ -150,6 +152,13 @@ static int ps2_mouse_wait_ack(uint32_t spins) {
     return 0;
 }
 
+static int ps2_mouse_get_id(uint8_t *out_id) {
+    if (!out_id) return 0;
+    ps2_mouse_write(0xF2);
+    if (!ps2_mouse_wait_ack(500000)) return 0;
+    return ps2_read_data_timeout(out_id, 500000);
+}
+
 static void ps2_configure_controller(void) {
     uint8_t cmd_byte = 0;
 
@@ -187,6 +196,27 @@ static void ps2_mouse_init(void) {
     ps2_mouse_write(0xF4);
     (void)ps2_mouse_wait_ack(500000);
 
+    // Try to enable wheel (IntelliMouse) mode.
+    ps2_mouse_write(0xF3);
+    (void)ps2_mouse_wait_ack(500000);
+    ps2_mouse_write(200);
+    (void)ps2_mouse_wait_ack(500000);
+    ps2_mouse_write(0xF3);
+    (void)ps2_mouse_wait_ack(500000);
+    ps2_mouse_write(100);
+    (void)ps2_mouse_wait_ack(500000);
+    ps2_mouse_write(0xF3);
+    (void)ps2_mouse_wait_ack(500000);
+    ps2_mouse_write(80);
+    (void)ps2_mouse_wait_ack(500000);
+
+    uint8_t mouse_id = 0;
+    if (ps2_mouse_get_id(&mouse_id) && mouse_id == 3) {
+        g_mouse_pkt_bytes = 4;
+    } else {
+        g_mouse_pkt_bytes = 3;
+    }
+
     ps2_flush_output();
 }
 
@@ -201,6 +231,11 @@ static wm_window_t *g_drag_win = NULL;
 static int g_drag_off_x = 0;
 static int g_drag_off_y = 0;
 static int g_resize_edges = 0; // bitmask: 1 left,2 right,4 top,8 bottom
+
+// Scrollbar drag (for console windows)
+static int g_scroll_dragging = 0;
+static wm_window_t *g_scroll_drag_win = NULL;
+static int g_scroll_drag_offset = 0;
 
 // Full-screen backbuffer to reduce flicker/tearing.
 static uint32_t *g_backbuf = NULL;
@@ -229,6 +264,7 @@ static uint32_t screen_h(void) { return fb_root.height; }
 
 static uint32_t *wm_get_app_icon_scaled(const char *app_name, int target_px);
 static int load_icon_file_exact(const char *path, void **out_buf, uint32_t *out_size);
+static int window_scrollbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h);
 static uint32_t rd_u32_le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -347,7 +383,10 @@ static void console_rebind_if_needed(wm_window_t *w) {
     if (!w) return;
     if (!w->client_px) return;
     if (!w->owner || !w->owner->console) return;
-    console_bind_target(w->owner->console, w->client_px, (uint32_t)w->client_w, (uint32_t)w->client_h, w->client_pitch);
+    uint32_t bind_w = (uint32_t)w->client_w;
+    int sb = console_scrollbar_width_px();
+    if (sb > 0 && bind_w > (uint32_t)sb + 8) bind_w -= (uint32_t)sb;
+    console_bind_target(w->owner->console, w->client_px, bind_w, (uint32_t)w->client_h, w->client_pitch);
     console_redraw(w->owner->console);
     wm_mark_dirty();
 }
@@ -478,6 +517,37 @@ static void blit_client(uint32_t *dst, uint32_t pitch, int sw, wm_window_t *w) {
         uint32_t *dst_row = (uint32_t *)((uintptr_t)dst + (uintptr_t)(w->client_y + yy) * pitch);
         for (int xx = 0; xx < w->client_w; ++xx) dst_row[w->client_x + xx] = src_row[xx];
     }
+}
+
+static void draw_console_scrollbar(uint32_t *dst, uint32_t pitch, int sw, int sh, wm_window_t *w) {
+    (void)sh;
+    if (!w || !w->owner || !w->owner->console) return;
+    int sb_x, sb_y, sb_w, sb_h;
+    if (!window_scrollbar_rect(w, &sb_x, &sb_y, &sb_w, &sb_h)) return;
+
+    int top = 0, visible = 0, total = 0;
+    console_get_scroll_info(w->owner->console, &top, &visible, &total);
+    if (visible <= 0 || total <= 0) return;
+
+    uint32_t track_col = 0x1A1B1E;
+    uint32_t thumb_col = 0x4B5563;
+    uint32_t border_col = 0x0F1012;
+
+    fill_rect(dst, pitch, sw, (int)screen_h(), sb_x, sb_y, sb_w, sb_h, track_col);
+    fill_rect(dst, pitch, sw, (int)screen_h(), sb_x, sb_y, sb_w, 1, border_col);
+    fill_rect(dst, pitch, sw, (int)screen_h(), sb_x, sb_y + sb_h - 1, sb_w, 1, border_col);
+
+    int max_scroll = total - visible;
+    if (max_scroll < 1) {
+        fill_rect(dst, pitch, sw, (int)screen_h(), sb_x + 1, sb_y + 1, sb_w - 2, sb_h - 2, thumb_col);
+        return;
+    }
+
+    int thumb_h = (sb_h * visible) / total;
+    if (thumb_h < 16) thumb_h = 16;
+    if (thumb_h > sb_h) thumb_h = sb_h;
+    int thumb_y = sb_y + (int)((uint64_t)(sb_h - thumb_h) * (uint64_t)top / (uint64_t)max_scroll);
+    fill_rect(dst, pitch, sw, (int)screen_h(), sb_x + 1, thumb_y, sb_w - 2, thumb_h, thumb_col);
 }
 
 static void draw_taskbar(uint32_t *dst, uint32_t pitch, int sw, int sh) {
@@ -1147,21 +1217,26 @@ static int kbd_scancode_to_key(uint8_t sc) {
     return (int)c;
 }
 
+static void handle_mouse_wheel(int delta);
+
 static void mouse_push_byte(uint8_t b) {
     // First byte must have bit3 set; helps resync on packet loss.
     if (g_mouse_pkt_i == 0 && (b & 0x08) == 0) return;
     g_mouse_pkt[g_mouse_pkt_i++] = b;
-    if (g_mouse_pkt_i < 3) return;
+    if (g_mouse_pkt_i < g_mouse_pkt_bytes) return;
     g_mouse_pkt_i = 0;
 
     uint8_t b0 = g_mouse_pkt[0];
     int dx = (int)((signed char)g_mouse_pkt[1]);
     int dy = (int)((signed char)g_mouse_pkt[2]);
+    int wheel = 0;
+    if (g_mouse_pkt_bytes == 4) wheel = (int)((signed char)g_mouse_pkt[3]);
 
     // Standard PS/2: dy is negative when moving up.
     (void)b0;
     g_mouse_x += dx;
     g_mouse_y -= dy;
+    if (dx != 0 || dy != 0) g_mouse_moved = 1;
 
     int sw = (int)screen_w();
     int sh = (int)screen_h();
@@ -1173,6 +1248,8 @@ static void mouse_push_byte(uint8_t b) {
     int left = (b0 & 1) ? 1 : 0;
     g_mouse_left = left;
     wm_mark_dirty();
+
+    if (wheel != 0) handle_mouse_wheel(wheel);
 }
 
 static int titlebar_contains(wm_window_t *w, int x, int y) {
@@ -1181,6 +1258,20 @@ static int titlebar_contains(wm_window_t *w, int x, int y) {
 
 static int client_contains(wm_window_t *w, int x, int y) {
     return rect_contains(x, y, w->client_x, w->client_y, w->client_w, w->client_h);
+}
+
+static int window_scrollbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h) {
+    if (!w || !w->owner || !w->owner->console) return 0;
+    int sb = console_scrollbar_width_px();
+    if (sb <= 0 || w->client_w <= sb) return 0;
+    int x = w->client_x + w->client_w - sb;
+    int y = w->client_y;
+    int h = w->client_h;
+    if (out_x) *out_x = x;
+    if (out_y) *out_y = y;
+    if (out_w) *out_w = sb;
+    if (out_h) *out_h = h;
+    return 1;
 }
 
 static void win_toggle_maximize(wm_window_t *w) {
@@ -1294,6 +1385,33 @@ static void handle_click_start_menu(int x, int y) {
     }
 }
 
+static void handle_console_scrollbar_mouse_down(wm_window_t *w, int x, int y) {
+    if (!w || !w->owner || !w->owner->console) return;
+    int sb_x, sb_y, sb_w, sb_h;
+    if (!window_scrollbar_rect(w, &sb_x, &sb_y, &sb_w, &sb_h)) return;
+    if (!rect_contains(x, y, sb_x, sb_y, sb_w, sb_h)) return;
+
+    int top = 0, visible = 0, total = 0;
+    console_get_scroll_info(w->owner->console, &top, &visible, &total);
+    if (visible <= 0 || total <= visible) return;
+
+    int max_scroll = total - visible;
+    int thumb_h = (sb_h * visible) / total;
+    if (thumb_h < 16) thumb_h = 16;
+    if (thumb_h > sb_h) thumb_h = sb_h;
+    int thumb_y = sb_y + (int)((uint64_t)(sb_h - thumb_h) * (uint64_t)top / (uint64_t)max_scroll);
+
+    if (rect_contains(x, y, sb_x, thumb_y, sb_w, thumb_h)) {
+        g_scroll_dragging = 1;
+        g_scroll_drag_win = w;
+        g_scroll_drag_offset = y - thumb_y;
+        return;
+    }
+
+    if (y < thumb_y) console_scroll_lines(w->owner->console, -visible);
+    else console_scroll_lines(w->owner->console, visible);
+}
+
 static void handle_mouse_down(void) {
     int x = g_mouse_x;
     int y = g_mouse_y;
@@ -1330,6 +1448,16 @@ static void handle_mouse_down(void) {
         return;
     }
 
+    // Console scrollbar (if present)
+    if (w->owner && w->owner->console) {
+        int sb_x, sb_y, sb_w, sb_h;
+        if (window_scrollbar_rect(w, &sb_x, &sb_y, &sb_w, &sb_h) &&
+            rect_contains(x, y, sb_x, sb_y, sb_w, sb_h)) {
+            handle_console_scrollbar_mouse_down(w, x, y);
+            return;
+        }
+    }
+
     // Resize edges (4px)
     const int r = 4;
     int edges = 0;
@@ -1361,6 +1489,12 @@ static void handle_mouse_down(void) {
 }
 
 static void handle_mouse_up(void) {
+    if (g_scroll_dragging) {
+        g_scroll_dragging = 0;
+        g_scroll_drag_win = NULL;
+        g_scroll_drag_offset = 0;
+        return;
+    }
     wm_window_t *w = g_drag_win;
     g_drag_mode = DRAG_NONE;
     g_drag_win = NULL;
@@ -1371,7 +1505,39 @@ static void handle_mouse_up(void) {
 }
 
 static void handle_mouse_move(void) {
-    if (g_drag_mode == DRAG_NONE || !g_drag_win) return;
+    if (!g_mouse_moved && !g_scroll_dragging && g_drag_mode == DRAG_NONE) return;
+    if (g_scroll_dragging && g_scroll_drag_win) {
+        wm_window_t *w = g_scroll_drag_win;
+        int sb_x, sb_y, sb_w, sb_h;
+        if (!window_scrollbar_rect(w, &sb_x, &sb_y, &sb_w, &sb_h)) return;
+
+        int top = 0, visible = 0, total = 0;
+        console_get_scroll_info(w->owner->console, &top, &visible, &total);
+        if (visible <= 0 || total <= visible) return;
+
+        int max_scroll = total - visible;
+        int thumb_h = (sb_h * visible) / total;
+        if (thumb_h < 16) thumb_h = 16;
+        if (thumb_h > sb_h) thumb_h = sb_h;
+        int max_thumb_y = sb_y + sb_h - thumb_h;
+        int new_thumb_y = g_mouse_y - g_scroll_drag_offset;
+        if (new_thumb_y < sb_y) new_thumb_y = sb_y;
+        if (new_thumb_y > max_thumb_y) new_thumb_y = max_thumb_y;
+        int new_top = 0;
+        if (sb_h > thumb_h) {
+            new_top = (int)((uint64_t)(new_thumb_y - sb_y) * (uint64_t)max_scroll / (uint64_t)(sb_h - thumb_h));
+        }
+        console_scroll_to(w->owner->console, new_top);
+        return;
+    }
+
+    if (g_drag_mode == DRAG_NONE || !g_drag_win) {
+        wm_window_t *w = win_at(g_mouse_x, g_mouse_y);
+        if (w && client_contains(w, g_mouse_x, g_mouse_y)) {
+            win_post_mouse(w, MLJOS_UI_EVENT_MOUSE_MOVE, g_mouse_x - w->client_x, g_mouse_y - w->client_y);
+        }
+        return;
+    }
     wm_window_t *w = g_drag_win;
     if (!w->used) { g_drag_mode = DRAG_NONE; g_drag_win = NULL; return; }
 
@@ -1428,6 +1594,24 @@ static void handle_mouse_move(void) {
     }
 }
 
+static void handle_mouse_wheel(int delta) {
+    wm_window_t *w = win_at(g_mouse_x, g_mouse_y);
+    if (!w || w->minimized) return;
+    if (w->owner && w->owner->console && client_contains(w, g_mouse_x, g_mouse_y)) {
+        int lines = delta * 3;
+        console_scroll_lines(w->owner->console, -lines);
+        return;
+    }
+    if (client_contains(w, g_mouse_x, g_mouse_y)) {
+        mljos_ui_event_t ev;
+        ev.type = MLJOS_UI_EVENT_MOUSE_WHEEL;
+        ev.x = g_mouse_x - w->client_x;
+        ev.y = g_mouse_y - w->client_y;
+        ev.key = delta;
+        (void)q_push(&w->q, &ev);
+    }
+}
+
 void wm_pump_input(void) {
     // Drain available bytes from controller.
     while (inb(0x64) & 1) {
@@ -1449,6 +1633,7 @@ void wm_pump_input(void) {
     handle_mouse_move();
     
     g_mouse_left_prev = g_mouse_left;
+    g_mouse_moved = 0;
 }
 
 void wm_compose_if_dirty(void) {
@@ -1482,6 +1667,7 @@ void wm_compose_if_dirty(void) {
         if (!w->used || w->minimized) continue;
         draw_window_frame(dst, pitch, sw, sh, w);
         blit_client(dst, pitch, sw, w);
+        draw_console_scrollbar(dst, pitch, sw, sh, w);
     }
 
     draw_taskbar(dst, pitch, sw, sh);

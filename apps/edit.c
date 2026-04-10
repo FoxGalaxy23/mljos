@@ -11,11 +11,14 @@ static int line_lens[MAX_LINES];
 static int num_lines = 1;
 static int cx = 0, cy = 0;
 static int scroll_y = 0;
+static int scroll_drag = 0;
+static int scroll_drag_offset = 0;
 static char filename[128];
 static char temporary_msg[128];
 
 static int copy_str(char *dst, const char *src, int maxlen);
 static int text_len(const char *text);
+static int clamp_int(int v, int lo, int hi);
 
 static void load_file(mljos_api_t *api, const char *path) {
     if (!path || !path[0]) return;
@@ -239,11 +242,23 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
             int top_h = 30;
             int bot_h = 24;
             int lh = 16;
+            int scrollbar_w = 12;
+            int left_pad = 10;
+            int right_pad = 10;
+            int text_x = left_pad;
+            int text_w = w - left_pad - right_pad - scrollbar_w;
+            if (text_w < 8) text_w = 8;
+            int max_cols = text_w / 8;
+            if (max_cols < 1) max_cols = 1;
             
             // Adjust scroll based on cursor height smoothly
             int max_visible = (h - top_h - bot_h) / lh;
+            if (max_visible < 1) max_visible = 1;
+            int max_scroll = num_lines - max_visible;
+            if (max_scroll < 0) max_scroll = 0;
             if (cy < scroll_y) scroll_y = cy;
             if (cy >= scroll_y + max_visible) scroll_y = cy - max_visible + 1;
+            scroll_y = clamp_int(scroll_y, 0, max_scroll);
             
             if (dirty) {
                 // Background
@@ -264,15 +279,33 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
                     
                     int y = top_h + (i * lh);
                     // Single char rendering for proper cursor calc
-                    for (int j = 0; j < line_lens[l]; j++) {
+                    for (int j = 0; j < line_lens[l] && j < max_cols; j++) {
                         char cc[2] = { lines[l][j], 0 };
-                        api->ui->draw_text(cc, 10 + j * 8, y + 2, col_text);
+                        api->ui->draw_text(cc, text_x + j * 8, y + 2, col_text);
                     }
                     
                     // Draw cursor
                     if (l == cy) {
-                        api->ui->fill_rect(10 + cx * 8, y + 14, 8, 2, col_cursor);
+                        if (cx >= 0 && cx < max_cols) {
+                            api->ui->fill_rect(text_x + cx * 8, y + 14, 8, 2, col_cursor);
+                        }
                     }
+                }
+
+                // Scrollbar
+                int sb_x = w - right_pad - scrollbar_w;
+                int track_y = top_h;
+                int track_h = h - top_h - bot_h;
+                if (track_h < 1) track_h = 1;
+                api->ui->fill_rect(sb_x, track_y, scrollbar_w, track_h, 0x1A1B1E);
+                if (max_scroll > 0) {
+                    int thumb_h = (track_h * max_visible) / num_lines;
+                    if (thumb_h < 16) thumb_h = 16;
+                    if (thumb_h > track_h) thumb_h = track_h;
+                    int thumb_y = track_y + (int)((uint64_t)(track_h - thumb_h) * (uint64_t)scroll_y / (uint64_t)max_scroll);
+                    api->ui->fill_rect(sb_x + 1, thumb_y, scrollbar_w - 2, thumb_h, 0x3C3C3C);
+                } else {
+                    api->ui->fill_rect(sb_x + 1, track_y + 1, scrollbar_w - 2, track_h - 2, 0x3C3C3C);
                 }
                 
                 // Bottom status
@@ -302,9 +335,36 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
                             return;
                         }
                     } else if (ev.y >= top_h && ev.y <= h - bot_h) {
+                        int sb_x = w - right_pad - scrollbar_w;
+                        int track_y = top_h;
+                        int track_h = h - top_h - bot_h;
+                        if (track_h < 1) track_h = 1;
+                        int max_scroll = num_lines - max_visible;
+                        if (max_scroll < 0) max_scroll = 0;
+
+                        if (ev.x >= sb_x && ev.x < sb_x + scrollbar_w) {
+                            if (max_scroll > 0) {
+                                int thumb_h = (track_h * max_visible) / num_lines;
+                                if (thumb_h < 16) thumb_h = 16;
+                                if (thumb_h > track_h) thumb_h = track_h;
+                                int thumb_y = track_y + (int)((uint64_t)(track_h - thumb_h) * (uint64_t)scroll_y / (uint64_t)max_scroll);
+                                if (ev.y >= thumb_y && ev.y < thumb_y + thumb_h) {
+                                    scroll_drag = 1;
+                                    scroll_drag_offset = ev.y - thumb_y;
+                                } else if (ev.y < thumb_y) {
+                                    scroll_y -= max_visible;
+                                } else if (ev.y > thumb_y + thumb_h) {
+                                    scroll_y += max_visible;
+                                }
+                                scroll_y = clamp_int(scroll_y, 0, max_scroll);
+                                dirty = 1;
+                            }
+                            continue;
+                        }
+
                         // Click on text repositions cursor
                         int r = (ev.y - top_h) / lh;
-                        int c = (ev.x - 10) / 8;
+                        int c = (ev.x - text_x) / 8;
                         if (c < 0) c = 0;
                         int clicked_line = scroll_y + r;
                         if (clicked_line < num_lines) {
@@ -313,6 +373,44 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
                             else cx = c;
                             dirty = 1;
                         }
+                    }
+                }
+
+                if (ev.type == MLJOS_UI_EVENT_MOUSE_LEFT_UP) {
+                    scroll_drag = 0;
+                }
+
+                if (ev.type == MLJOS_UI_EVENT_MOUSE_MOVE) {
+                    if (scroll_drag) {
+                        int track_y = top_h;
+                        int track_h = h - top_h - bot_h;
+                        if (track_h < 1) track_h = 1;
+                        int max_scroll = num_lines - max_visible;
+                        if (max_scroll < 0) max_scroll = 0;
+                        if (max_scroll > 0) {
+                            int thumb_h = (track_h * max_visible) / num_lines;
+                            if (thumb_h < 16) thumb_h = 16;
+                            if (thumb_h > track_h) thumb_h = track_h;
+                            if (track_h > thumb_h) {
+                                int max_thumb_y = track_y + track_h - thumb_h;
+                                int new_thumb_y = ev.y - scroll_drag_offset;
+                                if (new_thumb_y < track_y) new_thumb_y = track_y;
+                                if (new_thumb_y > max_thumb_y) new_thumb_y = max_thumb_y;
+                                scroll_y = (int)((uint64_t)(new_thumb_y - track_y) * (uint64_t)max_scroll / (uint64_t)(track_h - thumb_h));
+                                scroll_y = clamp_int(scroll_y, 0, max_scroll);
+                                dirty = 1;
+                            }
+                        }
+                    }
+                }
+
+                if (ev.type == MLJOS_UI_EVENT_MOUSE_WHEEL) {
+                    int max_scroll = num_lines - max_visible;
+                    if (max_scroll < 0) max_scroll = 0;
+                    if (max_scroll > 0) {
+                        scroll_y -= ev.key * 3;
+                        scroll_y = clamp_int(scroll_y, 0, max_scroll);
+                        dirty = 1;
                     }
                 }
                 
@@ -362,4 +460,10 @@ static int text_len(const char *text) {
     int len = 0;
     while (text[len]) len++;
     return len;
+}
+
+static int clamp_int(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
 }

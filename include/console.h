@@ -57,6 +57,14 @@ int console_is_visible(console_t *c);
 // Полная перерисовка текста из буфера в текущий viewport.
 void console_redraw(console_t *c);
 void scroll_if_needed(void);
+// Scroll view by a number of text lines (positive = down, negative = up).
+void console_scroll_lines(console_t *c, int delta);
+// Scroll view to an absolute top row (0..max).
+void console_scroll_to(console_t *c, int top);
+// Scrollbar width in pixels (for UI layout).
+int console_scrollbar_width_px(void);
+// Returns current scroll info: top row, visible rows, total rows.
+void console_get_scroll_info(console_t *c, int *out_top, int *out_visible, int *out_total);
 void putchar_at(char ch, int row, int col);
 void putchar(char ch);
 void puts(const char *s);

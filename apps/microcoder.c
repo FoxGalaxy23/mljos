@@ -860,8 +860,14 @@ static int compile_and_run(mljos_api_t *api, const char *program_text, const cha
         }
 
         // We build the output in a buffer
-        static char out_buf[16000];
+        // Must be large enough to hold the runner + marker + bytecode.
+        static char out_buf[65536];
         unsigned int out_pos = 0;
+
+        if ((unsigned int)(runner_size + 6 + code_len) > sizeof(out_buf)) {
+            api->puts("Tiny-C error: output .app too large\n");
+            return 0;
+        }
         
         for (unsigned int i = 0; i < runner_size; i++) out_buf[out_pos++] = runner_buf[i];
         

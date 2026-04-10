@@ -40,7 +40,8 @@ MLJOS_APP_ENTRY void _start(mljos_api_t *api) {
     
     // Search for the magic marker: "MCBYTE"
     int found = 0;
-    for (int i = 0; i < 8192; i++) {
+    // Scan a larger window to survive bigger runner images.
+    for (int i = 0; i < 65536; i++) {
         if (p[i] == 'M' && p[i+1] == 'C' && p[i+2] == 'B' && p[i+3] == 'Y' && p[i+4] == 'T' && p[i+5] == 'E') {
             p = &p[i+6];
             found = 1;

@@ -12,8 +12,10 @@ typedef enum {
     MLJOS_UI_EVENT_MOUSE_LEFT_DOWN = 2,
     MLJOS_UI_EVENT_MOUSE_LEFT_UP = 3,
     MLJOS_UI_EVENT_MOUSE_MOVE = 4,
+    // Mouse wheel: use `key` as signed delta (positive = wheel up).
+    MLJOS_UI_EVENT_MOUSE_WHEEL = 5,
     // Request app to repaint (e.g. after window move/show/restore)
-    MLJOS_UI_EVENT_EXPOSE = 5,
+    MLJOS_UI_EVENT_EXPOSE = 6,
 } mljos_ui_event_type_t;
 
 typedef struct {

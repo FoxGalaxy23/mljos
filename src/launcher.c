@@ -92,10 +92,14 @@ int launcher_launch_gui_args(const char *name, const char *open_path) {
     if (strcmp(name, "terminal") == 0) {
         console_t *c = console_create();
         task_attach_console(t, c);
+        uint32_t client_w = (uint32_t)wm_window_client_w(w);
+        uint32_t client_h = (uint32_t)wm_window_client_h(w);
+        int sb = console_scrollbar_width_px();
+        if (sb > 0 && client_w > (uint32_t)sb + 8) client_w -= (uint32_t)sb;
         console_bind_target(c,
             wm_window_client_pixels(w),
-            (uint32_t)wm_window_client_w(w),
-            (uint32_t)wm_window_client_h(w),
+            client_w,
+            client_h,
             wm_window_client_pitch_bytes(w));
         console_set_visible(c, 1);
         console_redraw(c);
