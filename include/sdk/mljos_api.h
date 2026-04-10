@@ -71,6 +71,9 @@ typedef struct {
     int (*launch_app)(const char *name_or_path);
     // Launch an executable application asynchronously and set its open_path
     int (*launch_app_args)(const char *name_or_path, const char *open_path);
+    int (*clipboard_set)(const char *text);
+    int (*clipboard_get)(char *out, int maxlen);
+    int (*clipboard_has_text)(void);
 
     // GUI mode / graphics (optional)
     uint32_t launch_flags;   // MLJOS_LAUNCH_*

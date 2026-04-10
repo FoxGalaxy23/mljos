@@ -32,6 +32,7 @@ static void init_tab(editor_tab_t *tab);
 static void create_tab(const char *path);
 static void close_tab_if_possible(void);
 static void copy_tab(editor_tab_t *dst, const editor_tab_t *src);
+static void insert_text_at_cursor(editor_tab_t *tab, const char *text, int *dirty);
 
 static editor_tab_t *active_tab(void) {
     if (g_active_tab < 0) g_active_tab = 0;
@@ -186,6 +187,16 @@ static void handle_key(mljos_api_t *api, int key, int *dirty) {
     if (key == 15) { // Ctrl+O
         save_file(api);
         *dirty = 1;
+    } else if (key == 3) { // Ctrl+C
+        char line[MAX_COLS];
+        int pos = 0;
+        for (int i = 0; i < tab->line_lens[tab->cy] && pos < MAX_COLS - 1; ++i) line[pos++] = tab->lines[tab->cy][i];
+        line[pos] = '\0';
+        if (api->clipboard_set) {
+            api->clipboard_set(line);
+            copy_str(temporary_msg, "Current line copied.", sizeof(temporary_msg));
+            *dirty = 1;
+        }
     } else if (key == 1000) { // UP
         if (tab->cy > 0) { tab->cy--; if (tab->cx > tab->line_lens[tab->cy]) tab->cx = tab->line_lens[tab->cy]; }
         if (tab->cy < tab->scroll_y) tab->scroll_y = tab->cy;
@@ -232,6 +243,11 @@ static void handle_key(mljos_api_t *api, int key, int *dirty) {
                 if (tab->cy < tab->scroll_y) tab->scroll_y = tab->cy;
                 *dirty = 1;
             }
+        }
+    } else if (key == 22) { // Ctrl+V
+        char clip[1024];
+        if (api->clipboard_get && api->clipboard_get(clip, sizeof(clip)) > 0) {
+            insert_text_at_cursor(tab, clip, dirty);
         }
     } else if (key >= 32 && key <= 126) { // Printable chars
         if (tab->line_lens[tab->cy] < MAX_COLS - 1) {
@@ -565,4 +581,35 @@ static int clamp_int(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+static void insert_text_at_cursor(editor_tab_t *tab, const char *text, int *dirty) {
+    if (!tab || !text) return;
+    for (int i = 0; text[i]; ++i) {
+        char ch = text[i];
+        if (ch == '\r') continue;
+        if (ch == '\n') {
+            if (tab->num_lines >= MAX_LINES) break;
+            for (int row = tab->num_lines; row > tab->cy + 1; --row) {
+                tab->line_lens[row] = tab->line_lens[row - 1];
+                for (int col = 0; col < MAX_COLS; ++col) tab->lines[row][col] = tab->lines[row - 1][col];
+            }
+            tab->line_lens[tab->cy + 1] = tab->line_lens[tab->cy] - tab->cx;
+            for (int col = 0; col < tab->line_lens[tab->cy + 1]; ++col) tab->lines[tab->cy + 1][col] = tab->lines[tab->cy][tab->cx + col];
+            tab->lines[tab->cy][tab->cx] = '\0';
+            tab->line_lens[tab->cy] = tab->cx;
+            tab->num_lines++;
+            tab->cy++;
+            tab->cx = 0;
+            if (dirty) *dirty = 1;
+            continue;
+        }
+        if (ch < 32 || ch > 126) continue;
+        if (tab->line_lens[tab->cy] >= MAX_COLS - 1) continue;
+        for (int col = tab->line_lens[tab->cy]; col > tab->cx; --col) tab->lines[tab->cy][col] = tab->lines[tab->cy][col - 1];
+        tab->lines[tab->cy][tab->cx] = ch;
+        tab->line_lens[tab->cy]++;
+        tab->cx++;
+        if (dirty) *dirty = 1;
+    }
 }

@@ -65,6 +65,11 @@ void console_scroll_to(console_t *c, int top);
 int console_scrollbar_width_px(void);
 // Returns current scroll info: top row, visible rows, total rows.
 void console_get_scroll_info(console_t *c, int *out_top, int *out_visible, int *out_total);
+int console_get_view_cols(console_t *c);
+int console_get_view_rows(console_t *c);
+uint8_t console_get_cell_char(console_t *c, int row, int col);
+uint32_t console_get_cell_color(console_t *c, int row, int col);
+int console_copy_range(console_t *c, int start_row, int start_col, int end_row, int end_col, char *out, int maxlen);
 void putchar_at(char ch, int row, int col);
 void putchar(char ch);
 void puts(const char *s);

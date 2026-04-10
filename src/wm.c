@@ -2,6 +2,7 @@
 
 #include "apps_registry.h"
 #include "bmp.h"
+#include "clipboard.h"
 #include "console.h"
 #include "disk.h"
 #include "font.h"
@@ -46,6 +47,12 @@ static const uint32_t COL_TITLE_FG = 0xFFFFFF;
 static const uint32_t COL_BTN_BG = 0x3A3D44;
 static const uint32_t COL_BTN_FG = 0xFFFFFF;
 static const uint32_t COL_BTN_CLOSE = 0xB91C1C;
+static const uint32_t COL_TERM_SEL_BG = 0x1F6FEB;
+static const uint32_t COL_TERM_SEL_FG = 0xFFFFFF;
+static const uint32_t COL_MENU_BG = 0x1B1E23;
+static const uint32_t COL_MENU_BORDER = 0x0F1012;
+static const uint32_t COL_MENU_HOVER = 0x2D66D2;
+static const uint32_t COL_MENU_DISABLED = 0x777777;
 
 typedef struct wm_event_queue {
     mljos_ui_event_t ev[WM_MAX_EVENTS];
@@ -76,6 +83,12 @@ struct wm_window {
     uint8_t terminal_active_tab;
     task_t *terminal_tabs[TERM_TAB_MAX];
     char terminal_tab_titles[TERM_TAB_MAX][24];
+    uint8_t terminal_selecting;
+    uint8_t terminal_selection_active;
+    int terminal_sel_anchor_row;
+    int terminal_sel_anchor_col;
+    int terminal_sel_row;
+    int terminal_sel_col;
 };
 
 static wm_window_t g_windows[WM_MAX_WINDOWS];
@@ -97,10 +110,16 @@ static int g_mouse_x = 10;
 static int g_mouse_y = 10;
 static int g_mouse_left = 0;
 static int g_mouse_left_prev = 0;
+static int g_mouse_right = 0;
+static int g_mouse_right_prev = 0;
 static uint8_t g_mouse_pkt[4];
 static int g_mouse_pkt_i = 0;
 static int g_mouse_pkt_bytes = 3;
 static int g_mouse_moved = 0;
+static int g_context_menu_open = 0;
+static int g_context_menu_x = 0;
+static int g_context_menu_y = 0;
+static wm_window_t *g_context_menu_window = NULL;
 
 static void ps2_wait_input_empty(void) {
     while (inb(0x64) & 2) { }
@@ -274,9 +293,22 @@ static uint32_t screen_h(void) { return fb_root.height; }
 
 static uint32_t *wm_get_app_icon_scaled(const char *app_name, int target_px);
 static int load_icon_file_exact(const char *path, void **out_buf, uint32_t *out_size);
+static int titlebar_contains(wm_window_t *w, int x, int y);
+static int client_contains(wm_window_t *w, int x, int y);
 static int window_scrollbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h);
 static int window_terminal_tabbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h);
 static int window_terminal_content_offset_y(wm_window_t *w);
+static int window_terminal_has_selection(wm_window_t *w);
+static void window_terminal_clear_selection(wm_window_t *w);
+static int window_terminal_hit_test_cell(wm_window_t *w, int screen_x, int screen_y, int *out_row, int *out_col);
+static void window_terminal_begin_selection(wm_window_t *w, int screen_x, int screen_y);
+static void window_terminal_update_selection(wm_window_t *w, int screen_x, int screen_y);
+static int window_terminal_copy_selection(wm_window_t *w);
+static void draw_terminal_selection(uint32_t *dst, uint32_t pitch, int sw, int sh, wm_window_t *w);
+static void context_menu_open_for_window(wm_window_t *w, int x, int y);
+static void context_menu_close(void);
+static int handle_context_menu_left_click(int x, int y);
+static void handle_mouse_right_down(void);
 static void window_terminal_sync_active(wm_window_t *w);
 static int window_all_terminal_tabs_dead(wm_window_t *w);
 static uint32_t rd_u32_le(const uint8_t *p) {
@@ -482,6 +514,192 @@ static void win_post_expose(wm_window_t *w) {
     (void)q_push(&w->q, &ev);
 }
 
+static int window_terminal_has_selection(wm_window_t *w) {
+    if (!w || !w->owner || !w->owner->console) return 0;
+    return w->terminal_selection_active ? 1 : 0;
+}
+
+static void window_terminal_clear_selection(wm_window_t *w) {
+    if (!w) return;
+    w->terminal_selecting = 0;
+    w->terminal_selection_active = 0;
+    w->terminal_sel_anchor_row = 0;
+    w->terminal_sel_anchor_col = 0;
+    w->terminal_sel_row = 0;
+    w->terminal_sel_col = 0;
+    wm_mark_dirty();
+}
+
+static int window_terminal_hit_test_cell(wm_window_t *w, int screen_x, int screen_y, int *out_row, int *out_col) {
+    int local_x = 0;
+    int local_y = 0;
+    int top = 0;
+    int visible = 0;
+    int total = 0;
+    int cols = 0;
+    int rows = 0;
+    if (!w || !w->owner || !w->owner->console) return 0;
+    if (!client_contains(w, screen_x, screen_y)) return 0;
+
+    local_x = screen_x - w->client_x;
+    local_y = screen_y - w->client_y - window_terminal_content_offset_y(w);
+    if (local_y < 0) return 0;
+    cols = console_get_view_cols(w->owner->console);
+    rows = console_get_view_rows(w->owner->console);
+    if (cols <= 0 || rows <= 0) return 0;
+    if (local_x < 0 || local_x >= cols * 8) return 0;
+    if (local_y < 0 || local_y >= rows * 16) return 0;
+
+    console_get_scroll_info(w->owner->console, &top, &visible, &total);
+    if (visible <= 0) return 0;
+    if (out_row) *out_row = top + (local_y / 16);
+    if (out_col) *out_col = local_x / 8;
+    return 1;
+}
+
+static void window_terminal_begin_selection(wm_window_t *w, int screen_x, int screen_y) {
+    int row = 0;
+    int col = 0;
+    if (!window_terminal_hit_test_cell(w, screen_x, screen_y, &row, &col)) {
+        window_terminal_clear_selection(w);
+        return;
+    }
+    w->terminal_selecting = 1;
+    w->terminal_selection_active = 1;
+    w->terminal_sel_anchor_row = row;
+    w->terminal_sel_anchor_col = col;
+    w->terminal_sel_row = row;
+    w->terminal_sel_col = col;
+    wm_mark_dirty();
+}
+
+static void window_terminal_update_selection(wm_window_t *w, int screen_x, int screen_y) {
+    int row = 0;
+    int col = 0;
+    if (!w || !w->terminal_selecting) return;
+    if (!window_terminal_hit_test_cell(w, screen_x, screen_y, &row, &col)) return;
+    w->terminal_sel_row = row;
+    w->terminal_sel_col = col;
+    w->terminal_selection_active = 1;
+    wm_mark_dirty();
+}
+
+static int window_terminal_copy_selection(wm_window_t *w) {
+    char buf[4096];
+    int copied = 0;
+    if (!window_terminal_has_selection(w)) return 0;
+    copied = console_copy_range(
+        w->owner->console,
+        w->terminal_sel_anchor_row,
+        w->terminal_sel_anchor_col,
+        w->terminal_sel_row,
+        w->terminal_sel_col,
+        buf,
+        sizeof(buf)
+    );
+    if (copied <= 0) return 0;
+    clipboard_set_text(buf);
+    return copied;
+}
+
+static void draw_terminal_selection(uint32_t *dst, uint32_t pitch, int sw, int sh, wm_window_t *w) {
+    int start_row = 0;
+    int start_col = 0;
+    int end_row = 0;
+    int end_col = 0;
+    int top = 0;
+    int visible = 0;
+    int total = 0;
+    if (!window_terminal_has_selection(w)) return;
+
+    if (w->terminal_sel_anchor_row < w->terminal_sel_row ||
+        (w->terminal_sel_anchor_row == w->terminal_sel_row && w->terminal_sel_anchor_col <= w->terminal_sel_col)) {
+        start_row = w->terminal_sel_anchor_row;
+        start_col = w->terminal_sel_anchor_col;
+        end_row = w->terminal_sel_row;
+        end_col = w->terminal_sel_col;
+    } else {
+        start_row = w->terminal_sel_row;
+        start_col = w->terminal_sel_col;
+        end_row = w->terminal_sel_anchor_row;
+        end_col = w->terminal_sel_anchor_col;
+    }
+
+    console_get_scroll_info(w->owner->console, &top, &visible, &total);
+    for (int row = start_row; row <= end_row; ++row) {
+        int draw_row = row - top;
+        int row_start_col = (row == start_row) ? start_col : 0;
+        int row_end_col = (row == end_row) ? end_col : console_get_view_cols(w->owner->console) - 1;
+        if (draw_row < 0 || draw_row >= console_get_view_rows(w->owner->console)) continue;
+        for (int col = row_start_col; col <= row_end_col; ++col) {
+            char cell_text[2];
+            int px = w->client_x + col * 8;
+            int py = w->client_y + window_terminal_content_offset_y(w) + draw_row * 16;
+            uint8_t ch = console_get_cell_char(w->owner->console, row, col);
+            fill_rect(dst, pitch, sw, sh, px, py, 8, 16, COL_TERM_SEL_BG);
+            cell_text[0] = (char)(ch ? ch : ' ');
+            cell_text[1] = '\0';
+            draw_text(dst, pitch, sw, sh, cell_text, px, py, COL_TERM_SEL_FG);
+        }
+    }
+}
+
+static void context_menu_open_for_window(wm_window_t *w, int x, int y) {
+    const int menu_w = 120;
+    const int menu_h = 44;
+    int sw = (int)screen_w();
+    int sh = (int)screen_h();
+    g_context_menu_open = 1;
+    g_context_menu_window = w;
+    if (x + menu_w > sw) x = sw - menu_w;
+    if (y + menu_h > sh) y = sh - menu_h;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    g_context_menu_x = x;
+    g_context_menu_y = y;
+    wm_mark_dirty();
+}
+
+static void context_menu_close(void) {
+    g_context_menu_open = 0;
+    g_context_menu_window = NULL;
+    wm_mark_dirty();
+}
+
+static int handle_context_menu_left_click(int x, int y) {
+    const int menu_w = 120;
+    const int row_h = 22;
+    int can_copy = 0;
+    int can_paste = clipboard_has_text();
+    if (!g_context_menu_open) return 0;
+    can_copy = window_terminal_has_selection(g_context_menu_window);
+    if (!rect_contains(x, y, g_context_menu_x, g_context_menu_y, menu_w, row_h * 2)) {
+        context_menu_close();
+        return 0;
+    }
+    if (y < g_context_menu_y + row_h) {
+        if (can_copy) (void)window_terminal_copy_selection(g_context_menu_window);
+    } else {
+        if (can_paste && g_context_menu_window) win_post_key(g_context_menu_window, 22);
+    }
+    context_menu_close();
+    return 1;
+}
+
+static void handle_mouse_right_down(void) {
+    wm_window_t *w = win_at(g_mouse_x, g_mouse_y);
+    if (!w || w->minimized) {
+        context_menu_close();
+        return;
+    }
+    wm_window_focus(w);
+    if (client_contains(w, g_mouse_x, g_mouse_y)) {
+        context_menu_open_for_window(w, g_mouse_x, g_mouse_y);
+        return;
+    }
+    context_menu_close();
+}
+
 static void draw_window_frame(uint32_t *dst, uint32_t pitch, int sw, int sh, wm_window_t *w) {
     (void)sh;
     if (!w || w->minimized) return;
@@ -569,6 +787,29 @@ static void draw_console_scrollbar(uint32_t *dst, uint32_t pitch, int sw, int sh
     if (thumb_h > sb_h) thumb_h = sb_h;
     int thumb_y = sb_y + (int)((uint64_t)(sb_h - thumb_h) * (uint64_t)top / (uint64_t)max_scroll);
     fill_rect(dst, pitch, sw, (int)screen_h(), sb_x + 1, thumb_y, sb_w - 2, thumb_h, thumb_col);
+}
+
+static void draw_context_menu(uint32_t *dst, uint32_t pitch, int sw, int sh) {
+    const int menu_w = 120;
+    const int row_h = 22;
+    int menu_h = row_h * 2;
+    int x = g_context_menu_x;
+    int y = g_context_menu_y;
+    int hover = -1;
+    int can_copy = window_terminal_has_selection(g_context_menu_window);
+    int can_paste = clipboard_has_text();
+    if (!g_context_menu_open) return;
+    if (rect_contains(g_mouse_x, g_mouse_y, x, y, menu_w, menu_h)) {
+        hover = (g_mouse_y - y) / row_h;
+        if (hover < 0 || hover > 1) hover = -1;
+    }
+
+    fill_rect(dst, pitch, sw, sh, x, y, menu_w, menu_h, COL_MENU_BORDER);
+    fill_rect(dst, pitch, sw, sh, x + 1, y + 1, menu_w - 2, menu_h - 2, COL_MENU_BG);
+    if (hover == 0 && can_copy) fill_rect(dst, pitch, sw, sh, x + 2, y + 2, menu_w - 4, row_h - 2, COL_MENU_HOVER);
+    if (hover == 1 && can_paste) fill_rect(dst, pitch, sw, sh, x + 2, y + row_h, menu_w - 4, row_h - 2, COL_MENU_HOVER);
+    draw_text(dst, pitch, sw, sh, "Copy", x + 10, y + 4, can_copy ? 0xFFFFFF : COL_MENU_DISABLED);
+    draw_text(dst, pitch, sw, sh, "Paste", x + 10, y + row_h + 4, can_paste ? 0xFFFFFF : COL_MENU_DISABLED);
 }
 
 static int window_terminal_tabbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h) {
@@ -1055,6 +1296,7 @@ wm_window_t *wm_window_create(const char *title, int client_w_px, int client_h_p
 void wm_window_destroy(wm_window_t *w) {
     if (!w) return;
     if (g_terminal_window == w) g_terminal_window = NULL;
+    if (g_context_menu_window == w) context_menu_close();
     w->used = 0;
     if (g_focused == w) g_focused = NULL;
     z_rebuild();
@@ -1063,6 +1305,7 @@ void wm_window_destroy(wm_window_t *w) {
 
 void wm_window_set_owner(wm_window_t *w, struct task *owner) {
     if (!w) return;
+    window_terminal_clear_selection(w);
     w->owner = (task_t *)owner;
 }
 
@@ -1155,6 +1398,7 @@ void wm_window_set_title(wm_window_t *w, const char *title) {
 void wm_window_focus(wm_window_t *w) {
     if (!w) return;
     w->minimized = 0;
+    if (g_context_menu_window && g_context_menu_window != w) context_menu_close();
     g_focused = w;
     int idx = (int)(w - g_windows);
     z_focus_index(idx);
@@ -1252,6 +1496,15 @@ int wm_prompt_input(const char *title, const char *prompt, char *out_buf, int ma
                 } else if (ev.key == 27) {
                     status = 0;
                     done = 1;
+                } else if (ev.key == 22) {
+                    char clip[256];
+                    int clip_len = clipboard_get_text(clip, sizeof(clip));
+                    int l = text_len(out_buf);
+                    for (int i = 0; i < clip_len && l < max_len - 1; ++i) {
+                        if (clip[i] == '\r' || clip[i] == '\n') continue;
+                        out_buf[l++] = clip[i];
+                    }
+                    out_buf[l] = '\0';
                 } else if (ev.key == '\b') {
                     int l = text_len(out_buf);
                     if (l > 0) out_buf[l - 1] = '\0';
@@ -1410,7 +1663,9 @@ static void mouse_push_byte(uint8_t b) {
     if (g_mouse_y >= sh) g_mouse_y = sh - 1;
 
     int left = (b0 & 1) ? 1 : 0;
+    int right = (b0 & 2) ? 1 : 0;
     g_mouse_left = left;
+    g_mouse_right = right;
     wm_mark_dirty();
 
     if (wheel != 0) handle_mouse_wheel(wheel);
@@ -1594,6 +1849,11 @@ static void handle_mouse_down(void) {
     int x = g_mouse_x;
     int y = g_mouse_y;
 
+    if (g_context_menu_open) {
+        if (handle_context_menu_left_click(x, y)) return;
+        context_menu_close();
+    }
+
     // Taskbar / start menu get first dibs
     handle_click_start_menu(x, y);
     handle_click_taskbar(x, y);
@@ -1651,6 +1911,7 @@ static void handle_mouse_down(void) {
     }
 
     if (titlebar_contains(w, x, y)) {
+        window_terminal_clear_selection(w);
         g_drag_mode = DRAG_MOVE;
         g_drag_win = w;
         g_drag_off_x = x - w->x;
@@ -1662,6 +1923,7 @@ static void handle_mouse_down(void) {
         int tabbar_x = 0, tabbar_y = 0, tabbar_w = 0, tabbar_h = 0;
         if (window_terminal_tabbar_rect(w, &tabbar_x, &tabbar_y, &tabbar_w, &tabbar_h) &&
             rect_contains(x, y, tabbar_x, tabbar_y, tabbar_w, tabbar_h)) {
+            window_terminal_clear_selection(w);
             int tx = tabbar_x + 6;
             for (int i = 0; i < (int)w->terminal_tab_count; ++i) {
                 if (w->terminal_tab_count > 1 &&
@@ -1681,11 +1943,19 @@ static void handle_mouse_down(void) {
                 return;
             }
         }
+        if (w->owner && w->owner->console && y >= w->client_y + window_terminal_content_offset_y(w)) {
+            window_terminal_begin_selection(w, x, y);
+            return;
+        }
         win_post_mouse(w, MLJOS_UI_EVENT_MOUSE_LEFT_DOWN, x - w->client_x, y - w->client_y);
     }
 }
 
 static void handle_mouse_up(void) {
+    if (g_focused && g_focused->terminal_selecting) {
+        g_focused->terminal_selecting = 0;
+        wm_mark_dirty();
+    }
     if (g_scroll_dragging) {
         g_scroll_dragging = 0;
         g_scroll_drag_win = NULL;
@@ -1703,6 +1973,10 @@ static void handle_mouse_up(void) {
 
 static void handle_mouse_move(void) {
     if (!g_mouse_moved && !g_scroll_dragging && g_drag_mode == DRAG_NONE) return;
+    if (g_focused && g_focused->terminal_selecting) {
+        window_terminal_update_selection(g_focused, g_mouse_x, g_mouse_y);
+        return;
+    }
     if (g_scroll_dragging && g_scroll_drag_win) {
         wm_window_t *w = g_scroll_drag_win;
         int sb_x, sb_y, sb_w, sb_h;
@@ -1794,6 +2068,7 @@ static void handle_mouse_move(void) {
 static void handle_mouse_wheel(int delta) {
     wm_window_t *w = win_at(g_mouse_x, g_mouse_y);
     if (!w || w->minimized) return;
+    if (window_terminal_has_selection(w)) window_terminal_clear_selection(w);
     if (w->owner && w->owner->console && client_contains(w, g_mouse_x, g_mouse_y) &&
         g_mouse_y >= w->client_y + window_terminal_content_offset_y(w)) {
         int lines = delta * 3;
@@ -1838,7 +2113,13 @@ void wm_pump_input(void) {
                 if (g_focused) {
                     win_request_close(g_focused, 1);
                 }
+            } else if (key == 3 && g_focused && window_terminal_has_selection(g_focused)) {
+                (void)window_terminal_copy_selection(g_focused);
             } else if (key && g_focused) {
+                if (key >= 32 || key == '\b' || key == '\n' || key == '\r' || key == 22) {
+                    if (window_terminal_has_selection(g_focused)) window_terminal_clear_selection(g_focused);
+                }
+                if (g_context_menu_open) context_menu_close();
                 win_post_key(g_focused, key);
             }
         }
@@ -1847,9 +2128,11 @@ void wm_pump_input(void) {
     // Mouse transitions
     if (g_mouse_left && !g_mouse_left_prev) handle_mouse_down();
     if (!g_mouse_left && g_mouse_left_prev) handle_mouse_up();
+    if (g_mouse_right && !g_mouse_right_prev) handle_mouse_right_down();
     handle_mouse_move();
     
     g_mouse_left_prev = g_mouse_left;
+    g_mouse_right_prev = g_mouse_right;
     g_mouse_moved = 0;
 }
 
@@ -1886,10 +2169,12 @@ void wm_compose_if_dirty(void) {
         blit_client(dst, pitch, sw, w);
         draw_terminal_tabs(dst, pitch, sw, sh, w);
         draw_console_scrollbar(dst, pitch, sw, sh, w);
+        draw_terminal_selection(dst, pitch, sw, sh, w);
     }
 
     draw_taskbar(dst, pitch, sw, sh);
     draw_start_menu(dst, pitch, sw, sh);
+    draw_context_menu(dst, pitch, sw, sh);
     draw_cursor(dst, pitch, sw, sh);
 
     // Present: copy backbuffer to the real framebuffer in one pass.

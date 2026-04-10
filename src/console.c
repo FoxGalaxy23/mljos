@@ -529,6 +529,90 @@ void console_get_scroll_info(console_t *c, int *out_top, int *out_visible, int *
     if (out_total) *out_total = total;
 }
 
+int console_get_view_cols(console_t *c) {
+    if (!c) c = console_current_impl();
+    if (!c) return 0;
+    return (int)c->view_cols;
+}
+
+int console_get_view_rows(console_t *c) {
+    if (!c) c = console_current_impl();
+    if (!c) return 0;
+    return (int)c->view_rows;
+}
+
+uint8_t console_get_cell_char(console_t *c, int row, int col) {
+    if (!c) c = console_current_impl();
+    if (!c) return ' ';
+    if (row < 0 || col < 0) return ' ';
+    if ((uint32_t)row >= c->buf_rows || (uint32_t)col >= c->buf_cols) return ' ';
+    return c->cell_ch[row][col];
+}
+
+uint32_t console_get_cell_color(console_t *c, int row, int col) {
+    if (!c) c = console_current_impl();
+    if (!c) return COLOR_DEFAULT;
+    if (row < 0 || col < 0) return COLOR_DEFAULT;
+    if ((uint32_t)row >= c->buf_rows || (uint32_t)col >= c->buf_cols) return COLOR_DEFAULT;
+    return c->cell_color[row][col] ? c->cell_color[row][col] : COLOR_DEFAULT;
+}
+
+int console_copy_range(console_t *c, int start_row, int start_col, int end_row, int end_col, char *out, int maxlen) {
+    int top = 0;
+    int left = 0;
+    int bottom = 0;
+    int right = 0;
+    int pos = 0;
+    if (!c) c = console_current_impl();
+    if (!c || !out || maxlen <= 0) return 0;
+    out[0] = '\0';
+
+    if (start_row < end_row || (start_row == end_row && start_col <= end_col)) {
+        top = start_row;
+        left = start_col;
+        bottom = end_row;
+        right = end_col;
+    } else {
+        top = end_row;
+        left = end_col;
+        bottom = start_row;
+        right = start_col;
+    }
+
+    if (top < 0) top = 0;
+    if (bottom < 0) return 0;
+    if (left < 0) left = 0;
+    if (right < 0) right = 0;
+    if ((uint32_t)top >= c->buf_rows) return 0;
+    if ((uint32_t)bottom >= c->buf_rows) bottom = (int)c->buf_rows - 1;
+
+    for (int row = top; row <= bottom && pos < maxlen - 1; ++row) {
+        int row_start = (row == top) ? left : 0;
+        int row_end = (row == bottom) ? right : (int)c->buf_cols - 1;
+        int last_non_space = -1;
+        if (row_start < 0) row_start = 0;
+        if (row_end >= (int)c->buf_cols) row_end = (int)c->buf_cols - 1;
+        if (row_start > row_end) continue;
+
+        for (int col = row_start; col <= row_end; ++col) {
+            uint8_t ch = c->cell_ch[row][col];
+            if (ch != 0 && ch != ' ') last_non_space = col;
+        }
+
+        if (last_non_space >= row_start) {
+            for (int col = row_start; col <= last_non_space && pos < maxlen - 1; ++col) {
+                uint8_t ch = c->cell_ch[row][col];
+                out[pos++] = (char)(ch ? ch : ' ');
+            }
+        }
+
+        if (row != bottom && pos < maxlen - 1) out[pos++] = '\n';
+    }
+
+    out[pos] = '\0';
+    return pos;
+}
+
 void update_cursor(void) {
     // Software cursor not yet implemented, for now just a stub.
 }

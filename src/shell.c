@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "apps_registry.h"
+#include "clipboard.h"
 #include "console.h"
 #include "disk.h"
 #include "fs.h"
@@ -29,9 +30,13 @@ static void os_get_time(uint8_t *h, uint8_t *m, uint8_t *s);
 static void os_get_date(uint8_t *d, uint8_t *mo, uint16_t *y);
 static int os_launch_app(const char *name_or_path);
 static int os_launch_app_args(const char *name_or_path, const char *open_path);
+static int os_clipboard_set(const char *text);
+static int os_clipboard_get(char *out, int maxlen);
+static int os_clipboard_has_text(void);
 static int parse_decimal_number(const char *text, int *value_out);
 static int parse_resolution_text(const char *text, int *w_out, int *h_out);
 static void print_uint(uint32_t value);
+static int insert_text_into_line_buffer(char *buf, int maxlen, int *len, const char *text, int hide_input);
 
 typedef enum storage_target {
     STORAGE_RAM = 0,
@@ -101,6 +106,9 @@ mljos_api_t os_api = {
     .run_shell = shell_run,
     .launch_app = os_launch_app,
     .launch_app_args = os_launch_app_args,
+    .clipboard_set = os_clipboard_set,
+    .clipboard_get = os_clipboard_get,
+    .clipboard_has_text = os_clipboard_has_text,
     .launch_flags = 0,
     .ui = NULL,
 };
@@ -277,6 +285,18 @@ static int os_launch_app(const char *name_or_path) {
 
 static int os_launch_app_args(const char *name_or_path, const char *open_path) {
     return launcher_launch_gui_args(name_or_path, open_path);
+}
+
+static int os_clipboard_set(const char *text) {
+    return clipboard_set_text(text);
+}
+
+static int os_clipboard_get(char *out, int maxlen) {
+    return clipboard_get_text(out, maxlen);
+}
+
+static int os_clipboard_has_text(void) {
+    return clipboard_has_text();
 }
 
 // Shell history is per-task; stored in task_t fields.
@@ -561,6 +581,37 @@ static void clear_input_visual(int prompt_row, int prompt_col) {
     update_cursor();
 }
 
+static int insert_text_into_line_buffer(char *buf, int maxlen, int *len, const char *text, int hide_input) {
+    int inserted = 0;
+    if (!buf || !len || !text || maxlen <= 1) return 0;
+    while (text[inserted] && *len < maxlen - 1) {
+        char ch = text[inserted];
+        if (ch == '\r') {
+            inserted++;
+            continue;
+        }
+        if (ch == '\n') {
+            ch = ' ';
+        }
+        buf[*len] = ch;
+        (*len)++;
+        inserted++;
+        if (!hide_input) {
+            putchar_at(ch, cursor_row, cursor_col++);
+            if (cursor_col >= VGA_COLS) {
+                cursor_col = 0;
+                cursor_row++;
+                scroll_if_needed();
+            }
+        } else {
+            putchar('*');
+        }
+    }
+    buf[*len] = '\0';
+    update_cursor();
+    return inserted;
+}
+
 static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_history) {
     int len = 0;
     int prompt_row = cursor_row;
@@ -653,6 +704,15 @@ static int read_line_internal(char *buf, int maxlen, int hide_input, int allow_h
                     scroll_if_needed();
                 } else cursor_col++;
                 update_cursor();
+            }
+            continue;
+        }
+
+        if (c == 22) { // Ctrl+V
+            char clip[1024];
+            int clip_len = clipboard_get_text(clip, sizeof(clip));
+            if (clip_len > 0) {
+                (void)insert_text_into_line_buffer(buf, maxlen, &len, clip, hide_input);
             }
             continue;
         }
