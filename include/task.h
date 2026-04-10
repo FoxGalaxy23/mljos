@@ -9,7 +9,8 @@ typedef struct console console_t;
 typedef enum {
     TASK_UNUSED = 0,
     TASK_RUNNABLE = 1,
-    TASK_DEAD = 2,
+    TASK_PAUSED = 2,
+    TASK_DEAD = 3,
 } task_state_t;
 
 typedef struct task_context {
@@ -66,6 +67,8 @@ task_t *task_create_app(const char *name, const void *image, uint32_t image_size
 
 void task_attach_window(task_t *t, struct wm_window *w);
 void task_attach_console(task_t *t, console_t *c);
+void task_set_paused(task_t *t, int paused);
+int task_is_alive(const task_t *t);
 
 // Called by tasks to cooperatively yield back to the kernel scheduler.
 void task_yield(void);

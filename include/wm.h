@@ -29,6 +29,11 @@ void wm_window_destroy(wm_window_t *w);
 void wm_window_set_title(wm_window_t *w, const char *title);
 void wm_window_focus(wm_window_t *w);
 void wm_window_set_owner(wm_window_t *w, struct task *owner);
+int wm_window_add_terminal_tab(wm_window_t *w, struct task *owner, const char *title);
+int wm_window_terminal_tab_count(const wm_window_t *w);
+int wm_window_terminal_active_tab(const wm_window_t *w);
+int wm_window_activate_terminal_tab(wm_window_t *w, int index);
+int wm_window_close_terminal_tab(wm_window_t *w, int index);
 
 // Reap windows whose owners already exited after a close request.
 void wm_reap_closed_windows(void);

@@ -208,9 +208,21 @@ void task_attach_console(task_t *t, console_t *c) {
     t->console = c;
 }
 
+void task_set_paused(task_t *t, int paused) {
+    if (!t) return;
+    if (t->state == TASK_DEAD || t->state == TASK_UNUSED) return;
+    t->state = paused ? TASK_PAUSED : TASK_RUNNABLE;
+}
+
+int task_is_alive(const task_t *t) {
+    if (!t) return 0;
+    return t->state == TASK_RUNNABLE || t->state == TASK_PAUSED;
+}
+
 void task_kill(task_t *t) {
     if (!t) return;
     t->killed = 1;
+    if (t->state == TASK_PAUSED) t->state = TASK_RUNNABLE;
 }
 
 void task_yield(void) {

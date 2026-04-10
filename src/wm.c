@@ -11,6 +11,7 @@
 #include "kstring.h"
 #include "rtc.h"
 #include "task.h"
+#include "terminal_app.h"
 #include "users.h"
 
 #define WM_MAX_WINDOWS 16
@@ -24,6 +25,11 @@ static const int TITLE_PX = 20;
 static const int BTN_PX = 14;
 static const int BTN_GAP_PX = 4;
 static const int TASKBAR_PX = 24;
+#define TERM_TABBAR_PX 26
+#define TERM_TAB_GAP_PX 6
+#define TERM_TAB_W_PX 120
+#define TERM_TAB_ADD_W_PX 26
+#define TERM_TAB_MAX 8
 
 // Colors (0xRRGGBB)
 static const uint32_t COL_DESKTOP = 0x202225;
@@ -66,6 +72,10 @@ struct wm_window {
 
     wm_event_queue_t q;
     task_t *owner;
+    uint8_t terminal_tab_count;
+    uint8_t terminal_active_tab;
+    task_t *terminal_tabs[TERM_TAB_MAX];
+    char terminal_tab_titles[TERM_TAB_MAX][24];
 };
 
 static wm_window_t g_windows[WM_MAX_WINDOWS];
@@ -265,6 +275,10 @@ static uint32_t screen_h(void) { return fb_root.height; }
 static uint32_t *wm_get_app_icon_scaled(const char *app_name, int target_px);
 static int load_icon_file_exact(const char *path, void **out_buf, uint32_t *out_size);
 static int window_scrollbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h);
+static int window_terminal_tabbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h);
+static int window_terminal_content_offset_y(wm_window_t *w);
+static void window_terminal_sync_active(wm_window_t *w);
+static int window_all_terminal_tabs_dead(wm_window_t *w);
 static uint32_t rd_u32_le(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -384,9 +398,16 @@ static void console_rebind_if_needed(wm_window_t *w) {
     if (!w->client_px) return;
     if (!w->owner || !w->owner->console) return;
     uint32_t bind_w = (uint32_t)w->client_w;
+    int content_offset_y = window_terminal_content_offset_y(w);
+    uint32_t bind_h = (uint32_t)w->client_h;
+    uint32_t *bind_px = w->client_px;
+    if (content_offset_y > 0 && content_offset_y < w->client_h) {
+        bind_px = (uint32_t *)((uintptr_t)w->client_px + (uintptr_t)content_offset_y * w->client_pitch);
+        bind_h = (uint32_t)(w->client_h - content_offset_y);
+    }
     int sb = console_scrollbar_width_px();
     if (sb > 0 && bind_w > (uint32_t)sb + 8) bind_w -= (uint32_t)sb;
-    console_bind_target(w->owner->console, w->client_px, bind_w, (uint32_t)w->client_h, w->client_pitch);
+    console_bind_target(w->owner->console, bind_px, bind_w, bind_h, w->client_pitch);
     console_redraw(w->owner->console);
     wm_mark_dirty();
 }
@@ -548,6 +569,46 @@ static void draw_console_scrollbar(uint32_t *dst, uint32_t pitch, int sw, int sh
     if (thumb_h > sb_h) thumb_h = sb_h;
     int thumb_y = sb_y + (int)((uint64_t)(sb_h - thumb_h) * (uint64_t)top / (uint64_t)max_scroll);
     fill_rect(dst, pitch, sw, (int)screen_h(), sb_x + 1, thumb_y, sb_w - 2, thumb_h, thumb_col);
+}
+
+static int window_terminal_tabbar_rect(wm_window_t *w, int *out_x, int *out_y, int *out_w, int *out_h) {
+    if (!w || w->terminal_tab_count == 0) return 0;
+    if (out_x) *out_x = w->client_x;
+    if (out_y) *out_y = w->client_y;
+    if (out_w) *out_w = w->client_w;
+    if (out_h) *out_h = TERM_TABBAR_PX;
+    return 1;
+}
+
+static int window_terminal_content_offset_y(wm_window_t *w) {
+    return (w && w->terminal_tab_count > 0) ? TERM_TABBAR_PX : 0;
+}
+
+static void draw_terminal_tabs(uint32_t *dst, uint32_t pitch, int sw, int sh, wm_window_t *w) {
+    if (!w || w->terminal_tab_count == 0 || w->minimized) return;
+
+    int bar_x = 0, bar_y = 0, bar_w = 0, bar_h = 0;
+    if (!window_terminal_tabbar_rect(w, &bar_x, &bar_y, &bar_w, &bar_h)) return;
+
+    fill_rect(dst, pitch, sw, sh, bar_x, bar_y, bar_w, bar_h, 0x16181C);
+    fill_rect(dst, pitch, sw, sh, bar_x, bar_y + bar_h - 1, bar_w, 1, 0x2F343C);
+
+    int x = bar_x + 6;
+    for (int i = 0; i < (int)w->terminal_tab_count; ++i) {
+        uint32_t tab_col = (i == (int)w->terminal_active_tab) ? 0x1F6FEB : 0x2B3138;
+        fill_rect(dst, pitch, sw, sh, x, bar_y + 4, TERM_TAB_W_PX, bar_h - 8, tab_col);
+        draw_text(dst, pitch, sw, sh, w->terminal_tab_titles[i], x + 8, bar_y + 6, 0xFFFFFF);
+        if (w->terminal_tab_count > 1) {
+            fill_rect(dst, pitch, sw, sh, x + TERM_TAB_W_PX - 20, bar_y + 7, 12, 12, 0x7A1E1E);
+            draw_text(dst, pitch, sw, sh, "x", x + TERM_TAB_W_PX - 16, bar_y + 6, 0xFFFFFF);
+        }
+        x += TERM_TAB_W_PX + TERM_TAB_GAP_PX;
+    }
+
+    if ((int)w->terminal_tab_count < TERM_TAB_MAX) {
+        fill_rect(dst, pitch, sw, sh, x, bar_y + 4, TERM_TAB_ADD_W_PX, bar_h - 8, 0x2B3138);
+        draw_text(dst, pitch, sw, sh, "+", x + 9, bar_y + 6, 0xFFFFFF);
+    }
 }
 
 static void draw_taskbar(uint32_t *dst, uint32_t pitch, int sw, int sh) {
@@ -1005,6 +1066,81 @@ void wm_window_set_owner(wm_window_t *w, struct task *owner) {
     w->owner = (task_t *)owner;
 }
 
+int wm_window_add_terminal_tab(wm_window_t *w, struct task *owner, const char *title) {
+    if (!w || !owner) return 0;
+    if (w->terminal_tab_count >= TERM_TAB_MAX) return 0;
+
+    int idx = (int)w->terminal_tab_count;
+    w->terminal_tabs[idx] = (task_t *)owner;
+    w->terminal_tab_titles[idx][0] = '\0';
+    if (title) {
+        int i = 0;
+        while (title[i] && i < (int)sizeof(w->terminal_tab_titles[idx]) - 1) {
+            w->terminal_tab_titles[idx][i] = title[i];
+            i++;
+        }
+        w->terminal_tab_titles[idx][i] = '\0';
+    }
+    w->terminal_tab_count++;
+
+    for (int i = 0; i < idx; ++i) {
+        if (w->terminal_tabs[i]) {
+            task_set_paused(w->terminal_tabs[i], 1);
+            if (w->terminal_tabs[i]->console) console_set_visible(w->terminal_tabs[i]->console, 0);
+        }
+    }
+
+    w->terminal_active_tab = (uint8_t)idx;
+    wm_window_set_owner(w, owner);
+    window_terminal_sync_active(w);
+    wm_window_set_title(w, "Terminal");
+    return 1;
+}
+
+int wm_window_terminal_tab_count(const wm_window_t *w) {
+    return w ? (int)w->terminal_tab_count : 0;
+}
+
+int wm_window_terminal_active_tab(const wm_window_t *w) {
+    return w ? (int)w->terminal_active_tab : -1;
+}
+
+int wm_window_activate_terminal_tab(wm_window_t *w, int index) {
+    if (!w) return 0;
+    if (index < 0 || index >= (int)w->terminal_tab_count) return 0;
+    w->terminal_active_tab = (uint8_t)index;
+    wm_window_set_owner(w, w->terminal_tabs[index]);
+    window_terminal_sync_active(w);
+    wm_mark_dirty();
+    return 1;
+}
+
+int wm_window_close_terminal_tab(wm_window_t *w, int index) {
+    if (!w) return 0;
+    if (index < 0 || index >= (int)w->terminal_tab_count) return 0;
+    if (w->terminal_tab_count <= 1) return 0;
+
+    task_t *closing = w->terminal_tabs[index];
+    if (closing) {
+        task_kill(closing);
+        if (closing->console) console_set_visible(closing->console, 0);
+    }
+
+    for (int i = index; i < (int)w->terminal_tab_count - 1; ++i) {
+        w->terminal_tabs[i] = w->terminal_tabs[i + 1];
+        for (int j = 0; j < (int)sizeof(w->terminal_tab_titles[i]); ++j) {
+            w->terminal_tab_titles[i][j] = w->terminal_tab_titles[i + 1][j];
+        }
+    }
+    w->terminal_tab_count--;
+    if (w->terminal_active_tab >= w->terminal_tab_count) w->terminal_active_tab = w->terminal_tab_count - 1;
+    if (index < (int)w->terminal_active_tab) w->terminal_active_tab--;
+    wm_window_set_owner(w, w->terminal_tabs[w->terminal_active_tab]);
+    window_terminal_sync_active(w);
+    wm_mark_dirty();
+    return 1;
+}
+
 void wm_window_set_title(wm_window_t *w, const char *title) {
     if (!w) return;
     w->title[0] = '\0';
@@ -1063,6 +1199,29 @@ static int text_len(const char *s) {
     int i = 0;
     while (s && s[i]) i++;
     return i;
+}
+
+static void window_terminal_sync_active(wm_window_t *w) {
+    if (!w || w->terminal_tab_count == 0) return;
+    for (int i = 0; i < (int)w->terminal_tab_count; ++i) {
+        task_t *t = w->terminal_tabs[i];
+        if (!t) continue;
+        task_set_paused(t, i != (int)w->terminal_active_tab);
+        if (t->console) console_set_visible(t->console, i == (int)w->terminal_active_tab);
+    }
+    if (w->terminal_active_tab < w->terminal_tab_count) {
+        w->owner = w->terminal_tabs[w->terminal_active_tab];
+    }
+    console_rebind_if_needed(w);
+    win_post_expose(w);
+}
+
+static int window_all_terminal_tabs_dead(wm_window_t *w) {
+    if (!w || w->terminal_tab_count == 0) return (!w->owner || w->owner->state == TASK_DEAD);
+    for (int i = 0; i < (int)w->terminal_tab_count; ++i) {
+        if (task_is_alive(w->terminal_tabs[i])) return 0;
+    }
+    return 1;
 }
 
 int wm_prompt_input(const char *title, const char *prompt, char *out_buf, int max_len) {
@@ -1270,8 +1429,9 @@ static int window_scrollbar_rect(wm_window_t *w, int *out_x, int *out_y, int *ou
     int sb = console_scrollbar_width_px();
     if (sb <= 0 || w->client_w <= sb) return 0;
     int x = w->client_x + w->client_w - sb;
-    int y = w->client_y;
-    int h = w->client_h;
+    int y = w->client_y + window_terminal_content_offset_y(w);
+    int h = w->client_h - window_terminal_content_offset_y(w);
+    if (h <= 0) return 0;
     if (out_x) *out_x = x;
     if (out_y) *out_y = y;
     if (out_w) *out_w = sb;
@@ -1306,6 +1466,19 @@ static void win_minimize(wm_window_t *w) {
     w->minimized = 1;
     if (g_focused == w) g_focused = NULL;
     wm_mark_dirty();
+}
+
+static void win_request_close(wm_window_t *w, int hide_immediately) {
+    if (!w) return;
+    w->close_requested = 1;
+    if (w->terminal_tab_count > 0) {
+        for (int i = 0; i < (int)w->terminal_tab_count; ++i) {
+            if (w->terminal_tabs[i]) task_kill(w->terminal_tabs[i]);
+        }
+    } else if (w->owner) {
+        task_kill(w->owner);
+    }
+    if (hide_immediately) win_minimize(w);
 }
 
 static void win_restore(wm_window_t *w) {
@@ -1438,10 +1611,7 @@ static void handle_mouse_down(void) {
 
     if (rect_contains(x, y, bx3, by, BTN_PX, BTN_PX)) {
         // Close (request): kill owner task and hide window. Window is reaped after task exits.
-        w->close_requested = 1;
-        if (w->owner) task_kill(w->owner);
-        w->minimized = 1;
-        wm_mark_dirty();
+        win_request_close(w, 1);
         return;
     }
     if (rect_contains(x, y, bx2, by, BTN_PX, BTN_PX)) {
@@ -1489,6 +1659,28 @@ static void handle_mouse_down(void) {
     }
 
     if (client_contains(w, x, y)) {
+        int tabbar_x = 0, tabbar_y = 0, tabbar_w = 0, tabbar_h = 0;
+        if (window_terminal_tabbar_rect(w, &tabbar_x, &tabbar_y, &tabbar_w, &tabbar_h) &&
+            rect_contains(x, y, tabbar_x, tabbar_y, tabbar_w, tabbar_h)) {
+            int tx = tabbar_x + 6;
+            for (int i = 0; i < (int)w->terminal_tab_count; ++i) {
+                if (w->terminal_tab_count > 1 &&
+                    rect_contains(x, y, tx + TERM_TAB_W_PX - 20, tabbar_y + 7, 12, 12)) {
+                    (void)wm_window_close_terminal_tab(w, i);
+                    return;
+                }
+                if (rect_contains(x, y, tx, tabbar_y + 4, TERM_TAB_W_PX, tabbar_h - 8)) {
+                    (void)wm_window_activate_terminal_tab(w, i);
+                    return;
+                }
+                tx += TERM_TAB_W_PX + TERM_TAB_GAP_PX;
+            }
+            if ((int)w->terminal_tab_count < TERM_TAB_MAX &&
+                rect_contains(x, y, tx, tabbar_y + 4, TERM_TAB_ADD_W_PX, tabbar_h - 8)) {
+                (void)terminal_spawn();
+                return;
+            }
+        }
         win_post_mouse(w, MLJOS_UI_EVENT_MOUSE_LEFT_DOWN, x - w->client_x, y - w->client_y);
     }
 }
@@ -1602,7 +1794,8 @@ static void handle_mouse_move(void) {
 static void handle_mouse_wheel(int delta) {
     wm_window_t *w = win_at(g_mouse_x, g_mouse_y);
     if (!w || w->minimized) return;
-    if (w->owner && w->owner->console && client_contains(w, g_mouse_x, g_mouse_y)) {
+    if (w->owner && w->owner->console && client_contains(w, g_mouse_x, g_mouse_y) &&
+        g_mouse_y >= w->client_y + window_terminal_content_offset_y(w)) {
         int lines = delta * 3;
         console_scroll_lines(w->owner->console, -lines);
         return;
@@ -1643,7 +1836,7 @@ void wm_pump_input(void) {
                 }
             } else if (g_kbd_alt && (data & 0x7F) == 0x3E && !(data & 0x80)) { // Alt+F4
                 if (g_focused) {
-                    g_focused->close_requested = 1;
+                    win_request_close(g_focused, 1);
                 }
             } else if (key && g_focused) {
                 win_post_key(g_focused, key);
@@ -1691,6 +1884,7 @@ void wm_compose_if_dirty(void) {
         if (!w->used || w->minimized) continue;
         draw_window_frame(dst, pitch, sw, sh, w);
         blit_client(dst, pitch, sw, w);
+        draw_terminal_tabs(dst, pitch, sw, sh, w);
         draw_console_scrollbar(dst, pitch, sw, sh, w);
     }
 
@@ -1715,7 +1909,7 @@ void wm_reap_closed_windows(void) {
         wm_window_t *w = &g_windows[i];
         if (!w->used) continue;
         if (!w->close_requested) continue;
-        if (w->owner && w->owner->state == TASK_DEAD) {
+        if (window_all_terminal_tabs_dead(w)) {
             wm_window_destroy(w);
         }
     }

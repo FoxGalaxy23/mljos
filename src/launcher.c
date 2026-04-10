@@ -7,6 +7,7 @@
 #include "kstring.h"
 #include "rtc.h"
 #include "shell.h"
+#include "terminal_app.h"
 #include "task.h"
 #include "ui.h"
 #include "users.h"
@@ -58,6 +59,11 @@ int launcher_launch_gui(const char *name) {
 
 int launcher_launch_gui_args(const char *name, const char *open_path) {
     if (!name || !name[0]) return 0;
+
+    if (strcmp(name, "terminal") == 0) {
+        (void)open_path;
+        return terminal_spawn();
+    }
 
     char app_path[128];
     if (!fs_resolve_app_command(name, app_path, sizeof(app_path))) return 0;
