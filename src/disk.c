@@ -9,6 +9,7 @@
 #include "sdk/mljos_api.h"
 #include "task.h"
 #include "usb.h"
+#include "boot/legacy_bootsector_bin.h"
 
 typedef void (*app_entry_t)(mljos_api_t*);
 
@@ -22,7 +23,126 @@ extern uint8_t _kernel_end[];
 #define FAT32_MAX_CLUSTERS   0x0FFFFFEFU
 #define ATA_POLL_TIMEOUT     1000000U
 #define ATA_MAX_DEVICES      4
-#define DISK_MAX_DEVICES     (ATA_MAX_DEVICES + USB_MAX_STORAGE_DEVICES)
+#define AHCI_MAX_DEVICES     16
+#define DISK_MAX_DEVICES     (ATA_MAX_DEVICES + AHCI_MAX_DEVICES + USB_MAX_STORAGE_DEVICES)
+#define DISK_LEGACY_BOOT_START_LBA 1U
+#define DISK_PARTITION_ALIGN_LBA   2048U
+#define DISK_INSTALL_SAFETY_LBA    64U
+#define LEGACY_BOOT_PATCH_SIGNATURE 0x000000B9U
+#define PCI_CONFIG_ADDRESS   0xCF8
+#define PCI_CONFIG_DATA      0xCFC
+#define AHCI_CLASS_STORAGE   0x01
+#define AHCI_SUBCLASS_SATA   0x06
+#define AHCI_PROGIF_AHCI     0x01
+#define AHCI_PORT_SIG_ATA    0x00000101U
+#define AHCI_PORT_DET_PRESENT 0x3U
+#define AHCI_PORT_IPM_ACTIVE  0x1U
+#define AHCI_GHC_AE          0x80000000U
+#define AHCI_PXCMD_ST        0x0001U
+#define AHCI_PXCMD_FRE       0x0010U
+#define AHCI_PXCMD_FR        0x4000U
+#define AHCI_PXCMD_CR        0x8000U
+#define AHCI_PXTFD_BSY       0x80U
+#define AHCI_PXTFD_DRQ       0x08U
+#define AHCI_PXIS_TFES       (1U << 30)
+#define AHCI_ATA_CMD_IDENTIFY_DEVICE 0xEC
+#define AHCI_ATA_CMD_READ_DMA_EXT    0x25
+#define AHCI_ATA_CMD_WRITE_DMA_EXT   0x35
+#define AHCI_FIS_TYPE_REG_H2D        0x27
+
+typedef struct __attribute__((packed)) {
+    uint32_t clb;
+    uint32_t clbu;
+    uint32_t fb_addr;
+    uint32_t fbu_addr;
+    uint32_t is;
+    uint32_t ie;
+    uint32_t cmd;
+    uint32_t reserved0;
+    uint32_t tfd;
+    uint32_t sig;
+    uint32_t ssts;
+    uint32_t sctl;
+    uint32_t serr;
+    uint32_t sact;
+    uint32_t ci;
+    uint32_t sntf;
+    uint32_t fbs;
+    uint32_t reserved1[11];
+    uint32_t vendor[4];
+} ahci_port_regs_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t cap;
+    uint32_t ghc;
+    uint32_t is;
+    uint32_t pi;
+    uint32_t vs;
+    uint32_t ccc_ctl;
+    uint32_t ccc_pts;
+    uint32_t em_loc;
+    uint32_t em_ctl;
+    uint32_t cap2;
+    uint32_t bohc;
+    uint8_t reserved[0x74];
+    uint8_t vendor[0x60];
+    ahci_port_regs_t ports[32];
+} ahci_hba_regs_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t cfl : 5;
+    uint8_t a : 1;
+    uint8_t w : 1;
+    uint8_t p : 1;
+    uint8_t r : 1;
+    uint8_t b : 1;
+    uint8_t c : 1;
+    uint8_t reserved0 : 1;
+    uint8_t pmp : 4;
+    uint16_t prdtl;
+    volatile uint32_t prdbc;
+    uint32_t ctba;
+    uint32_t ctbau;
+    uint32_t reserved1[4];
+} ahci_cmd_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t dba;
+    uint32_t dbau;
+    uint32_t reserved0;
+    uint32_t dbc : 22;
+    uint32_t reserved1 : 9;
+    uint32_t i : 1;
+} ahci_prdt_entry_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t cfis[64];
+    uint8_t acmd[16];
+    uint8_t reserved[48];
+    ahci_prdt_entry_t prdt_entry[1];
+} ahci_cmd_table_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t fis_type;
+    uint8_t pmport : 4;
+    uint8_t reserved0 : 3;
+    uint8_t c : 1;
+    uint8_t command;
+    uint8_t featurel;
+    uint8_t lba0;
+    uint8_t lba1;
+    uint8_t lba2;
+    uint8_t device;
+    uint8_t lba3;
+    uint8_t lba4;
+    uint8_t lba5;
+    uint8_t featureh;
+    uint8_t countl;
+    uint8_t counth;
+    uint8_t icc;
+    uint8_t control;
+    uint8_t reserved1[4];
+} ahci_fis_reg_h2d_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t name[11];
@@ -62,6 +182,7 @@ typedef struct {
     uint16_t reserved_sector_count;
     uint8_t num_fats;
     uint8_t sectors_per_cluster;
+    uint32_t alloc_search_hint;
     char current_path[128];
 } fat32_volume_t;
 
@@ -88,10 +209,23 @@ typedef struct {
     const char *name;
 } ata_device_t;
 
+typedef struct {
+    volatile ahci_hba_regs_t *hba;
+    volatile ahci_port_regs_t *port;
+    ahci_cmd_header_t *cmd_list;
+    uint8_t *fis;
+    ahci_cmd_table_t *cmd_table;
+    uint32_t total_sectors;
+    uint8_t port_index;
+    int present;
+    const char *name;
+} ahci_device_t;
+
 typedef enum {
     DISK_BACKEND_NONE = 0,
     DISK_BACKEND_ATA = 1,
-    DISK_BACKEND_USB = 2
+    DISK_BACKEND_USB = 2,
+    DISK_BACKEND_AHCI = 3
 } disk_backend_type_t;
 
 typedef struct {
@@ -109,6 +243,7 @@ static ata_device_t g_ata_devices[ATA_MAX_DEVICES] = {
     {0x170, 0xE0, 0xA0, 0, 0, "ata2"},
     {0x170, 0xF0, 0xB0, 0, 0, "ata3"}
 };
+static ahci_device_t g_ahci_devices[AHCI_MAX_DEVICES] = {0};
 static disk_device_t g_disk_devices[DISK_MAX_DEVICES] = {0};
 static int g_disk_active_index = 0;
 static int g_disk_devices_probed = 0;
@@ -177,8 +312,13 @@ static void disk_probe_devices(void);
 static fat32_volume_t *disk_current_volume(void);
 static disk_device_t *disk_current_device(void);
 static ata_device_t *disk_current_ata_device(void);
+static ahci_device_t *disk_current_ahci_device(void);
 static int ata_read_sector(uint32_t lba, uint8_t *buffer);
 static int ata_write_sector(uint32_t lba, const uint8_t *buffer);
+
+static uint32_t disk_kernel_install_sectors(void);
+static uint32_t disk_partition_start_lba_for_install(uint32_t total_sectors);
+static int disk_install_legacy_bootsector(uint32_t num_sectors);
 
 #define g_fat32 (*disk_current_volume())
 
@@ -380,6 +520,53 @@ static void write_le32(uint8_t *p, uint32_t value) {
     p[3] = (uint8_t)((value >> 24) & 0xFF);
 }
 
+static uint32_t align_up_u32(uint32_t value, uint32_t align) {
+    if (align == 0) return value;
+    return ((value + align - 1U) / align) * align;
+}
+
+static uint32_t disk_kernel_install_sectors(void) {
+    uint32_t kernel_size = (uint32_t)((uintptr_t)_kernel_end - (uintptr_t)_kernel_start);
+    return (kernel_size + 511U) / 512U;
+}
+
+static uint32_t disk_partition_start_lba_for_install(uint32_t total_sectors) {
+    uint32_t min_start = DISK_PARTITION_ALIGN_LBA;
+    uint32_t install_end = DISK_LEGACY_BOOT_START_LBA + disk_kernel_install_sectors() + DISK_INSTALL_SAFETY_LBA;
+    uint32_t start = align_up_u32(install_end, DISK_PARTITION_ALIGN_LBA);
+
+    (void)total_sectors;
+    if (start < min_start) start = min_start;
+    return start;
+}
+
+static int disk_install_legacy_bootsector(uint32_t num_sectors) {
+    uint8_t mbr[512];
+    int patch_offset = -1;
+
+    if (legacy_bootsector_bin_size != 446U) return 0;
+    if (!ata_read_sector(0, mbr)) return 0;
+
+    for (uint32_t i = 0; i + 4 < legacy_bootsector_bin_size; i++) {
+        if (legacy_bootsector_bin_data[i] == 0xB9
+            && legacy_bootsector_bin_data[i + 1] == 0x00
+            && legacy_bootsector_bin_data[i + 2] == 0x00
+            && legacy_bootsector_bin_data[i + 3] == 0x00
+            && legacy_bootsector_bin_data[i + 4] == 0x00) {
+            patch_offset = (int)i + 1;
+            break;
+        }
+    }
+    if (patch_offset < 0 || patch_offset + 4 > 446) return 0;
+
+    kmemcpy(mbr, legacy_bootsector_bin_data, legacy_bootsector_bin_size);
+    write_le32(&mbr[patch_offset], num_sectors);
+    mbr[510] = 0x55;
+    mbr[511] = 0xAA;
+
+    return ata_write_sector(0, mbr);
+}
+
 static int is_fat32_eoc(uint32_t value) {
     return (value & 0x0FFFFFFF) >= 0x0FFFFFF8;
 }
@@ -418,6 +605,200 @@ static ata_device_t *disk_current_ata_device(void) {
     if (device->backend_index < 0 || device->backend_index >= ATA_MAX_DEVICES) return 0;
     if (!g_ata_devices[device->backend_index].present) return 0;
     return &g_ata_devices[device->backend_index];
+}
+
+static ahci_device_t *disk_current_ahci_device(void) {
+    disk_device_t *device = disk_current_device();
+
+    if (!device || device->type != DISK_BACKEND_AHCI) return 0;
+    if (device->backend_index < 0 || device->backend_index >= AHCI_MAX_DEVICES) return 0;
+    if (!g_ahci_devices[device->backend_index].present) return 0;
+    return &g_ahci_devices[device->backend_index];
+}
+
+static uint32_t pci_config_read32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset) {
+    uint32_t address = 0x80000000U
+        | ((uint32_t)bus << 16)
+        | ((uint32_t)device << 11)
+        | ((uint32_t)function << 8)
+        | (offset & 0xFCU);
+    outl(PCI_CONFIG_ADDRESS, address);
+    return inl(PCI_CONFIG_DATA);
+}
+
+static void pci_config_write32(uint8_t bus, uint8_t device, uint8_t function, uint8_t offset, uint32_t value) {
+    uint32_t address = 0x80000000U
+        | ((uint32_t)bus << 16)
+        | ((uint32_t)device << 11)
+        | ((uint32_t)function << 8)
+        | (offset & 0xFCU);
+    outl(PCI_CONFIG_ADDRESS, address);
+    outl(PCI_CONFIG_DATA, value);
+}
+
+static int ahci_port_wait_ready(volatile ahci_port_regs_t *port) {
+    if (!port) return 0;
+    for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
+        if (!(port->tfd & (AHCI_PXTFD_BSY | AHCI_PXTFD_DRQ))) return 1;
+    }
+    return 0;
+}
+
+static void ahci_stop_port(volatile ahci_port_regs_t *port) {
+    if (!port) return;
+    port->cmd &= ~AHCI_PXCMD_ST;
+    port->cmd &= ~AHCI_PXCMD_FRE;
+    for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
+        uint32_t cmd = port->cmd;
+        if (!(cmd & (AHCI_PXCMD_CR | AHCI_PXCMD_FR))) break;
+    }
+}
+
+static void ahci_start_port(volatile ahci_port_regs_t *port) {
+    if (!port) return;
+    for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
+        if (!(port->cmd & AHCI_PXCMD_CR)) break;
+    }
+    port->cmd |= AHCI_PXCMD_FRE;
+    port->cmd |= AHCI_PXCMD_ST;
+}
+
+static int ahci_port_usable(volatile ahci_port_regs_t *port) {
+    uint32_t ssts;
+    uint32_t det;
+    uint32_t ipm;
+
+    if (!port) return 0;
+    ssts = port->ssts;
+    det = ssts & 0x0F;
+    ipm = (ssts >> 8) & 0x0F;
+    if (det != AHCI_PORT_DET_PRESENT) return 0;
+    if (ipm != AHCI_PORT_IPM_ACTIVE) return 0;
+    return port->sig == AHCI_PORT_SIG_ATA;
+}
+
+static int ahci_prepare_port(ahci_device_t *device) {
+    volatile ahci_port_regs_t *port;
+    ahci_cmd_header_t *cmd_list;
+    uint8_t *fis;
+    ahci_cmd_table_t *cmd_table;
+
+    if (!device || !device->port) return 0;
+    if (device->cmd_list && device->fis && device->cmd_table) return 1;
+
+    port = device->port;
+    ahci_stop_port(port);
+
+    cmd_list = (ahci_cmd_header_t *)kmem_alloc(1024, 1024);
+    fis = (uint8_t *)kmem_alloc(256, 256);
+    cmd_table = (ahci_cmd_table_t *)kmem_alloc(sizeof(ahci_cmd_table_t), 128);
+    if (!cmd_list || !fis || !cmd_table) return 0;
+
+    kmemset(cmd_list, 0, 1024);
+    kmemset(fis, 0, 256);
+    kmemset(cmd_table, 0, sizeof(ahci_cmd_table_t));
+
+    port->clb = (uint32_t)(uintptr_t)cmd_list;
+    port->clbu = 0;
+    port->fb_addr = (uint32_t)(uintptr_t)fis;
+    port->fbu_addr = 0;
+    port->is = 0xFFFFFFFFU;
+    port->serr = 0xFFFFFFFFU;
+
+    cmd_list[0].prdtl = 1;
+    cmd_list[0].ctba = (uint32_t)(uintptr_t)cmd_table;
+    cmd_list[0].ctbau = 0;
+
+    device->cmd_list = cmd_list;
+    device->fis = fis;
+    device->cmd_table = cmd_table;
+
+    ahci_start_port(port);
+    return 1;
+}
+
+static int ahci_issue_ata(ahci_device_t *device, uint8_t command, uint64_t lba, uint16_t sector_count, uint8_t *buffer, int write) {
+    volatile ahci_port_regs_t *port;
+    ahci_cmd_header_t *header;
+    ahci_cmd_table_t *table;
+    ahci_fis_reg_h2d_t *fis;
+
+    if (!device || !device->present || !buffer || sector_count == 0) return 0;
+    if (!ahci_prepare_port(device)) return 0;
+
+    port = device->port;
+    header = &device->cmd_list[0];
+    table = device->cmd_table;
+
+    if (!ahci_port_wait_ready(port)) return 0;
+
+    port->is = 0xFFFFFFFFU;
+    port->serr = 0xFFFFFFFFU;
+    for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
+        if (!(port->ci & 1U)) break;
+    }
+    if (port->ci & 1U) return 0;
+
+    kmemset(header, 0, sizeof(*header));
+    kmemset(table, 0, sizeof(*table));
+
+    header->cfl = sizeof(ahci_fis_reg_h2d_t) / sizeof(uint32_t);
+    header->w = write ? 1 : 0;
+    header->prdtl = 1;
+    header->ctba = (uint32_t)(uintptr_t)table;
+    header->ctbau = 0;
+
+    table->prdt_entry[0].dba = (uint32_t)(uintptr_t)buffer;
+    table->prdt_entry[0].dbau = 0;
+    table->prdt_entry[0].dbc = ((uint32_t)sector_count * 512U) - 1U;
+    table->prdt_entry[0].i = 1;
+
+    fis = (ahci_fis_reg_h2d_t *)table->cfis;
+    fis->fis_type = AHCI_FIS_TYPE_REG_H2D;
+    fis->c = 1;
+    fis->command = command;
+    fis->device = 1U << 6;
+    fis->lba0 = (uint8_t)(lba & 0xFFU);
+    fis->lba1 = (uint8_t)((lba >> 8) & 0xFFU);
+    fis->lba2 = (uint8_t)((lba >> 16) & 0xFFU);
+    fis->lba3 = (uint8_t)((lba >> 24) & 0xFFU);
+    fis->lba4 = (uint8_t)((lba >> 32) & 0xFFU);
+    fis->lba5 = (uint8_t)((lba >> 40) & 0xFFU);
+    fis->countl = (uint8_t)(sector_count & 0xFFU);
+    fis->counth = (uint8_t)((sector_count >> 8) & 0xFFU);
+
+    port->ci = 1U;
+    for (uint32_t i = 0; i < ATA_POLL_TIMEOUT; i++) {
+        if (!(port->ci & 1U)) break;
+        if (port->is & AHCI_PXIS_TFES) return 0;
+    }
+
+    if (port->ci & 1U) return 0;
+    if (port->is & AHCI_PXIS_TFES) return 0;
+    return 1;
+}
+
+static uint32_t ahci_identify_total_sectors(ahci_device_t *device) {
+    uint8_t identify[512];
+    uint16_t feat;
+
+    if (!device) return 0;
+    kmemset(identify, 0, sizeof(identify));
+    if (!ahci_issue_ata(device, AHCI_ATA_CMD_IDENTIFY_DEVICE, 0, 1, identify, 0)) return 0;
+
+    feat = read_le16(&identify[166]);
+    if (feat & (1 << 10)) return read_le32(&identify[200]);
+    return read_le32(&identify[120]);
+}
+
+static int ahci_device_read_sector(const ahci_device_t *device, uint32_t lba, uint8_t *buffer) {
+    if (!device || !device->present) return 0;
+    return ahci_issue_ata((ahci_device_t *)device, AHCI_ATA_CMD_READ_DMA_EXT, lba, 1, buffer, 0);
+}
+
+static int ahci_device_write_sector(const ahci_device_t *device, uint32_t lba, const uint8_t *buffer) {
+    if (!device || !device->present) return 0;
+    return ahci_issue_ata((ahci_device_t *)device, AHCI_ATA_CMD_WRITE_DMA_EXT, lba, 1, (uint8_t *)buffer, 1);
 }
 
 static int ata_wait_bsy(uint16_t io_base) {
@@ -527,8 +908,10 @@ static void disk_probe_devices(void) {
     if (g_disk_devices_probed) return;
 
     int first_run = !g_disk_ever_probed;
+    int ahci_count = 0;
     g_disk_device_count = 0;
     kmemset(g_disk_devices, 0, sizeof(g_disk_devices));
+    kmemset(g_ahci_devices, 0, sizeof(g_ahci_devices));
     for (int i = 0; i < ATA_MAX_DEVICES; i++) {
         uint8_t identify[512];
         uint16_t io_base = g_ata_devices[i].io_base;
@@ -555,6 +938,90 @@ static void disk_probe_devices(void) {
                 fat32_reset_cwd();
             }
             g_disk_device_count++;
+        }
+    }
+
+    for (uint32_t bus = 0; bus < 256 && g_disk_device_count < DISK_MAX_DEVICES; bus++) {
+        for (uint8_t device = 0; device < 32 && g_disk_device_count < DISK_MAX_DEVICES; device++) {
+            uint32_t vendor_device = pci_config_read32((uint8_t)bus, device, 0, 0x00);
+            uint8_t header_type;
+            uint8_t function_count;
+
+            if ((vendor_device & 0xFFFFU) == 0xFFFFU) continue;
+
+            header_type = (uint8_t)((pci_config_read32((uint8_t)bus, device, 0, 0x0C) >> 16) & 0xFFU);
+            function_count = (header_type & 0x80U) ? 8 : 1;
+
+            for (uint8_t function = 0; function < function_count && g_disk_device_count < DISK_MAX_DEVICES; function++) {
+                uint32_t class_reg = pci_config_read32((uint8_t)bus, device, function, 0x08);
+                uint8_t class_code = (uint8_t)(class_reg >> 24);
+                uint8_t subclass = (uint8_t)(class_reg >> 16);
+                uint8_t prog_if = (uint8_t)(class_reg >> 8);
+                uint32_t abar_low;
+                uint64_t abar;
+                volatile ahci_hba_regs_t *hba;
+                uint32_t ports_bitmap;
+
+                if ((pci_config_read32((uint8_t)bus, device, function, 0x00) & 0xFFFFU) == 0xFFFFU) continue;
+                if (class_code != AHCI_CLASS_STORAGE || subclass != AHCI_SUBCLASS_SATA || prog_if != AHCI_PROGIF_AHCI) continue;
+
+                pci_config_write32((uint8_t)bus, device, function, 0x04, pci_config_read32((uint8_t)bus, device, function, 0x04) | 0x00000006U);
+
+                abar_low = pci_config_read32((uint8_t)bus, device, function, 0x24);
+                abar = (uint64_t)(abar_low & ~0x0FU);
+                if ((abar_low & 0x06U) == 0x04U) {
+                    uint32_t abar_high = pci_config_read32((uint8_t)bus, device, function, 0x28);
+                    abar |= ((uint64_t)abar_high << 32);
+                }
+                if (!abar || (abar >> 32) != 0) continue;
+
+                hba = (volatile ahci_hba_regs_t *)(uintptr_t)abar;
+                hba->ghc |= AHCI_GHC_AE;
+                ports_bitmap = hba->pi;
+
+                for (int port_index = 0; port_index < 32 && g_disk_device_count < DISK_MAX_DEVICES; port_index++) {
+                    ahci_device_t *ahci;
+                    disk_device_t *disk;
+                    char *label;
+
+                    if (!(ports_bitmap & (1U << port_index))) continue;
+                    if (ahci_count >= AHCI_MAX_DEVICES) continue;
+                    if (!ahci_port_usable(&hba->ports[port_index])) continue;
+
+                    ahci = &g_ahci_devices[ahci_count];
+                    ahci->hba = hba;
+                    ahci->port = &hba->ports[port_index];
+                    ahci->port_index = (uint8_t)port_index;
+                    ahci->name = "sata";
+                    ahci->present = ahci_prepare_port(ahci);
+                    if (!ahci->present) continue;
+
+                    ahci->total_sectors = ahci_identify_total_sectors(ahci);
+                    ahci->present = ahci->total_sectors > 0;
+                    if (!ahci->present) continue;
+
+                    disk = &g_disk_devices[g_disk_device_count];
+                    disk->type = DISK_BACKEND_AHCI;
+                    disk->backend_index = ahci_count;
+                    disk->total_sectors = ahci->total_sectors;
+                    disk->writable = 1;
+                    strcpy(disk->label, "sata");
+                    label = disk->label + 4;
+                    *label++ = (char)('0' + (ahci->port_index / 10));
+                    *label++ = (char)('0' + (ahci->port_index % 10));
+                    *label = '\0';
+                    if (disk->label[4] == '0') {
+                        disk->label[4] = disk->label[5];
+                        disk->label[5] = '\0';
+                    }
+                    if (first_run && !g_fat32_volumes[g_disk_device_count].current_path[0]) {
+                        g_disk_active_index = g_disk_device_count;
+                        fat32_reset_cwd();
+                    }
+                    ahci_count++;
+                    g_disk_device_count++;
+                }
+            }
         }
     }
 
@@ -642,6 +1109,7 @@ static int ata_read_sector(uint32_t lba, uint8_t *buffer) {
 
     if (!device) return 0;
     if (device->type == DISK_BACKEND_ATA) return ata_device_read_sector(disk_current_ata_device(), lba, buffer);
+    if (device->type == DISK_BACKEND_AHCI) return ahci_device_read_sector(disk_current_ahci_device(), lba, buffer);
     if (device->type == DISK_BACKEND_USB) return usb_storage_read_sector(device->backend_index, lba, buffer);
     return 0;
 }
@@ -650,6 +1118,7 @@ static int ata_write_sector(uint32_t lba, const uint8_t *buffer) {
     disk_device_t *device = disk_current_device();
     if (!device) return 0;
     if (device->type == DISK_BACKEND_ATA) return ata_device_write_sector(disk_current_ata_device(), lba, buffer);
+    if (device->type == DISK_BACKEND_AHCI) return ahci_device_write_sector(disk_current_ahci_device(), lba, buffer);
     if (device->type == DISK_BACKEND_USB) return usb_storage_write_sector(device->backend_index, lba, buffer);
     return 0;
 }
@@ -713,6 +1182,7 @@ static int fat32_mount(void) {
     g_fat32.fat_start_lba = g_fat32.partition_lba + g_fat32.reserved_sector_count;
     g_fat32.data_start_lba = g_fat32.partition_lba + g_fat32.reserved_sector_count + (g_fat32.num_fats * g_fat32.fat_size_sectors);
     g_fat32.total_clusters = (g_fat32.total_sectors - (g_fat32.data_start_lba - g_fat32.partition_lba)) / g_fat32.sectors_per_cluster;
+    g_fat32.alloc_search_hint = 3;
     g_fat32.mounted = 1;
     if (!g_fat32.current_path[0]) fat32_reset_cwd();
 
@@ -1070,8 +1540,18 @@ static int fat32_write_dir_entry_at(const fat32_dir_slot_t *slot, const fat32_di
 }
 
 static uint32_t fat32_find_free_cluster(void) {
-    for (uint32_t cluster = 2; cluster < g_fat32.total_clusters + 2; cluster++) {
+    uint32_t start = g_fat32.alloc_search_hint;
+    uint32_t end = g_fat32.total_clusters + 2;
+
+    if (start < 2 || start >= end) start = 2;
+
+    for (uint32_t cluster = start; cluster < end; cluster++) {
         if (fat32_read_fat_entry(cluster) == 0) return cluster;
+        if ((cluster & 127U) == 127U) task_yield();
+    }
+    for (uint32_t cluster = 2; cluster < start; cluster++) {
+        if (fat32_read_fat_entry(cluster) == 0) return cluster;
+        if ((cluster & 127U) == 127U) task_yield();
     }
     return 0;
 }
@@ -1102,10 +1582,13 @@ static uint32_t fat32_allocate_cluster_chain(uint32_t count) {
 
         fat32_write_fat_entry(cluster, FAT32_EOC);
         fat32_write_cluster(cluster, zero_cluster);
+        g_fat32.alloc_search_hint = cluster + 1;
+        if (g_fat32.alloc_search_hint >= g_fat32.total_clusters + 2) g_fat32.alloc_search_hint = 2;
 
         if (!first) first = cluster;
         if (prev) fat32_write_fat_entry(prev, cluster);
         prev = cluster;
+        if ((i & 31U) == 31U) task_yield();
     }
 
     return first;
@@ -1116,17 +1599,21 @@ static void fat32_free_cluster_chain(uint32_t first_cluster) {
     while (cluster >= 2 && !is_fat32_eoc(cluster)) {
         uint32_t next = fat32_read_fat_entry(cluster);
         fat32_write_fat_entry(cluster, 0);
+        if (cluster < g_fat32.alloc_search_hint || g_fat32.alloc_search_hint < 2) g_fat32.alloc_search_hint = cluster;
         if (is_fat32_eoc(next)) break;
         cluster = next;
+        if ((cluster & 31U) == 31U) task_yield();
     }
 
     if (cluster >= 2 && cluster < FAT32_EOC) fat32_write_fat_entry(cluster, 0);
+    if (cluster >= 2 && cluster < g_fat32.alloc_search_hint) g_fat32.alloc_search_hint = cluster;
 }
 
 static int fat32_find_free_dir_slots(uint32_t dir_cluster, int needed, fat32_dir_slot_t *out_slots) {
     uint8_t sector[512];
     uint32_t cluster = dir_cluster;
     int found = 0;
+    uint32_t scanned_clusters = 0;
 
     while (1) {
         uint32_t cluster_lba = fat32_cluster_to_lba(cluster);
@@ -1162,6 +1649,8 @@ static int fat32_find_free_dir_slots(uint32_t dir_cluster, int needed, fat32_dir
                 return 1;
             }
             cluster = next;
+            scanned_clusters++;
+            if ((scanned_clusters & 31U) == 31U) task_yield();
         }
     }
 }
@@ -1497,7 +1986,7 @@ static int disk_current_is_writable(void) {
 void cmd_disk_format(void) {
     disk_device_t *device = NULL;
     uint32_t total_sectors = 0;
-    uint32_t partition_lba = 2048;
+    uint32_t partition_lba;
     uint8_t sector[512];
     uint8_t fsinfo[512];
     uint8_t mbr[512];
@@ -1516,6 +2005,7 @@ void cmd_disk_format(void) {
 
     device = disk_current_device();
     total_sectors = device ? device->total_sectors : 0;
+    partition_lba = disk_partition_start_lba_for_install(total_sectors);
 
     if (!disk_require_active_device("disk format")) goto out;
     if (!device || !device->writable) {
@@ -2534,7 +3024,7 @@ void cmd_disk_install(void) {
     uintptr_t kernel_start = (uintptr_t)_kernel_start;
     uint32_t kernel_size = (uint32_t)((uintptr_t)_kernel_end - kernel_start);
     uint32_t num_sectors = (kernel_size + 511) / 512;
-    uint8_t sector0[512];
+    uint32_t partition_lba = 0;
 
     if (!disk_require_not_busy("disk install")) return;
     disk_exclusive_begin();
@@ -2549,12 +3039,29 @@ void cmd_disk_install(void) {
     putchar('\n');
 
     puts("Preparing installation files...\n");
+    if (!fat32_mount()) {
+        puts("Disk not formatted as FAT32.\n");
+        goto out;
+    }
+
+    partition_lba = g_fat32.partition_lba;
+    if (DISK_LEGACY_BOOT_START_LBA + num_sectors + DISK_INSTALL_SAFETY_LBA >= partition_lba) {
+        puts("disk install: kernel image overlaps the FAT32 partition\n");
+        puts("disk install: run `disk format` again so the installer can reserve enough boot space\n");
+        goto out;
+    }
+
+    if (!disk_install_legacy_bootsector(num_sectors)) {
+        puts("disk install: failed to write legacy boot sector\n");
+        goto out;
+    }
+
     // BIOS/Legacy: Write kernel to sector 1+
     // UEFI: Files will be synced from RAM FS to FAT32
 
     uint8_t *kmem = (uint8_t *)kernel_start;
     for (uint32_t i = 0; i < num_sectors; i++) {
-        if (!ata_write_sector(1 + i, kmem + (i * 512))) {
+        if (!ata_write_sector(DISK_LEGACY_BOOT_START_LBA + i, kmem + (i * 512))) {
             puts("Failed to write kernel data to disk\n");
             goto out;
         }

@@ -96,6 +96,35 @@ data = src.read_bytes() if src and src.is_file() else b''
 write_header(boot_dir / 'limine_bootx64_efi.h', 'limine_bootx64_efi', data)
 " 
 
+echo "Preparing legacy bootsector header..."
+BOOTSECTOR_BIN="$BUILD_DIR/bootsector.bin"
+nasm -f bin "$ROOT_DIR/boot/bootsector.asm" -o "$BOOTSECTOR_BIN"
+
+python3 -c "
+import pathlib
+
+def write_header(header_path: pathlib.Path, symbol: str, data: bytes) -> None:
+    guard = header_path.name.replace('.', '_').upper()
+    with header_path.open('w') as f:
+        f.write(f'#ifndef {guard}\\n#define {guard}\\n\\n')
+        f.write(f'static const unsigned int {symbol}_size = {len(data)};\\n')
+        if data:
+            f.write(f'static const unsigned char {symbol}_data[] = {{\\n')
+            for i in range(0, len(data), 20):
+                chunk = data[i:i+20]
+                f.write('    ' + ', '.join(f'0x{b:02x}' for b in chunk) + ',\\n')
+            f.write('};\\n\\n')
+        else:
+            f.write(f'static const unsigned char {symbol}_data[] = {{0x00}};\\n\\n')
+        f.write('#endif\\n')
+
+root = pathlib.Path('$GENERATED_INCLUDE_DIR')
+boot_dir = root / 'boot'
+boot_dir.mkdir(parents=True, exist_ok=True)
+data = pathlib.Path('$BOOTSECTOR_BIN').read_bytes()
+write_header(boot_dir / 'legacy_bootsector_bin.h', 'legacy_bootsector_bin', data)
+"
+
 if [ -n "$LIMINE_EFI_SRC" ]; then
     echo "Found Limine UEFI binary: $LIMINE_EFI_SRC"
 else

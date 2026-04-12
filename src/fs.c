@@ -420,11 +420,15 @@ static int fs_sync_node_to_disk(fs_node_t *node) {
     if (!node) return 0;
     if (node != fs_root) {
         build_node_path(node, path, sizeof(path));
+        puts("install: sync ");
+        puts(path);
+        putchar('\n');
         if (node->flags == FS_DIR) {
             if (!disk_ensure_directory(path)) return 0;
         } else {
             if (!disk_write_file(path, node->content, node->size)) return 0;
         }
+        task_yield();
     }
 
     if (node->flags == FS_DIR) {
