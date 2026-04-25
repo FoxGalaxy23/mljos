@@ -18,6 +18,7 @@ void wm_compose_if_dirty(void);
 void wm_mark_dirty(void);
 void wm_set_icon_scale_mode(wm_icon_scale_mode_t mode);
 void wm_on_resolution_change(void);
+void wm_on_task_exit(struct task *t);
 
 // GUI enable/disable (console-only mode)
 int wm_gui_enabled(void);
