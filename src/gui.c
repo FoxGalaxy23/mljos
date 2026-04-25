@@ -6,6 +6,8 @@
 #include "io.h"
 #include "apps_registry.h"
 #include "shell.h"
+#include "users.h"
+#include "fs.h"
 
 // Используем тот же моноширинный 8x16 шрифт.
 static const int CHAR_WIDTH = 8;
@@ -29,6 +31,22 @@ static uint8_t g_last_clock_sec = 255;
 // Start menu state
 static int g_start_menu_open = 0;
 
+// Desktop icons and context menu
+#define MAX_DESKTOP_ICONS 64
+typedef struct {
+    char name[32];
+    int x, y, w, h;
+    int is_dir;
+} desktop_icon_t;
+
+static desktop_icon_t g_desktop_icons[MAX_DESKTOP_ICONS];
+static int g_desktop_icon_count = 0;
+
+static int g_desktop_context_menu_open = 0;
+static int g_desktop_context_menu_x = 0;
+static int g_desktop_context_menu_y = 0;
+static char g_desktop_path[128] = {0};
+
 // Цвета (0xRRGGBB).
 static const uint32_t DESKTOP_BG = 0x202020;
 static const uint32_t TASKBAR_BG = 0x303030;
@@ -43,6 +61,8 @@ static int g_mouse_x_px = 0;
 static int g_mouse_y_px = 0;
 static int g_mouse_left = 0;
 static int g_mouse_left_prev = 0;
+static int g_mouse_right = 0;
+static int g_mouse_right_prev = 0;
 static int g_mouse_left_pressed_latch = 0;
 static int g_mouse_left_released_latch = 0;
 static int g_ui_expose_latch = 0;
@@ -642,16 +662,128 @@ static void gui_drag_update(void) {
     }
 }
 
+static void gui_refresh_desktop_icons(void) {
+    g_desktop_icon_count = 0;
+    const user_account_t *u = users_current();
+    if (!u) return;
+
+    int i = 0;
+    while (u->home[i] && i < sizeof(g_desktop_path) - 10) {
+        g_desktop_path[i] = u->home[i];
+        i++;
+    }
+    const char *d = "/desktop";
+    int j = 0;
+    while (d[j]) {
+        g_desktop_path[i++] = d[j++];
+    }
+    g_desktop_path[i] = '\0';
+
+    os_api.mkdir(g_desktop_path);
+
+    static int desktop_script_created = 0;
+    if (!desktop_script_created) {
+        desktop_script_created = 1;
+        char script_path[256];
+        int k = 0;
+        while (g_desktop_path[k] && k < 200) { script_path[k] = g_desktop_path[k]; k++; }
+        const char *s_ext = "/Files.scri";
+        int m = 0;
+        while (s_ext[m]) { script_path[k++] = s_ext[m++]; }
+        script_path[k] = '\0';
+        
+        char dummy_buf[2];
+        unsigned int out_sz = 0;
+        if (!os_api.read_file(script_path, dummy_buf, 1, &out_sz)) {
+            const char *content = "open files\n";
+            int c_len = 0;
+            while(content[c_len]) c_len++;
+            os_api.write_file(script_path, content, c_len);
+        }
+    }
+
+    char buf[4096];
+    if (!os_api.list_dir(g_desktop_path, buf, sizeof(buf))) return;
+
+    int x = 20, y = 20;
+    int item_h = 48;
+    int item_w = 64;
+
+    char *p = buf;
+    while (*p && g_desktop_icon_count < MAX_DESKTOP_ICONS) {
+        int is_dot = (p[0] == '.' && p[1] == '\0');
+        int is_dotdot = (p[0] == '.' && p[1] == '.' && p[2] == '\0');
+        if (!is_dot && !is_dotdot) {
+            desktop_icon_t *icon = &g_desktop_icons[g_desktop_icon_count];
+            int n = 0;
+            while (p[n] && n < 31) { icon->name[n] = p[n]; n++; }
+            icon->name[n] = '\0';
+            
+            icon->x = x;
+            icon->y = y;
+            icon->w = item_w;
+            icon->h = item_h;
+            
+            char test_path[256];
+            int k = 0;
+            while (g_desktop_path[k] && k < 250) { test_path[k] = g_desktop_path[k]; k++; }
+            test_path[k++] = '/';
+            n = 0;
+            while (icon->name[n] && k < 255) { test_path[k++] = icon->name[n++]; }
+            test_path[k] = '\0';
+            char dummy[2];
+            icon->is_dir = os_api.list_dir(test_path, dummy, sizeof(dummy));
+
+            g_desktop_icon_count++;
+            y += item_h + 20;
+            if (y + item_h > (int)fb_root.height - 40) {
+                y = 20;
+                x += item_w + 20;
+            }
+        }
+        while (*p) p++;
+        p++;
+    }
+}
+
+static void gui_draw_desktop_icons_ui(void) {
+    for (int i = 0; i < g_desktop_icon_count; i++) {
+        desktop_icon_t *icon = &g_desktop_icons[i];
+        uint32_t col = icon->is_dir ? 0xD4A373 : 0xEDEDED;
+        gui_fill_rect(icon->x + 16, icon->y, 32, 32, col);
+        
+        int name_len = 0;
+        while (icon->name[name_len]) name_len++;
+        int text_x = icon->x + 32 - (name_len * CHAR_WIDTH) / 2;
+        if (text_x < icon->x) text_x = icon->x;
+        gui_draw_text_transparent(icon->name, text_x, icon->y + 36, 0xFFFFFF);
+    }
+}
+
+static void gui_draw_desktop_context_menu(void) {
+    if (!g_desktop_context_menu_open) return;
+    int w = 140, h = 64;
+    gui_fill_rect(g_desktop_context_menu_x, g_desktop_context_menu_y, w, h, 0x101010);
+    gui_fill_rect(g_desktop_context_menu_x, g_desktop_context_menu_y, w, 32, 0x202020);
+    gui_draw_text_transparent("New Folder", g_desktop_context_menu_x + 8, g_desktop_context_menu_y + 8, 0xFFFFFF);
+    gui_fill_rect(g_desktop_context_menu_x, g_desktop_context_menu_y + 32, w, 32, 0x202020);
+    gui_draw_text_transparent("New File", g_desktop_context_menu_x + 8, g_desktop_context_menu_y + 40, 0xFFFFFF);
+}
+
+
 static void gui_draw_desktop(int redraw_console) {
     // Полная очистка — проще для прототипа.
     gui_fill_rect(0, 0, (int)fb_root.width, (int)fb_root.height, DESKTOP_BG);
 
     if (!g_in_dos_mode) {
+        gui_refresh_desktop_icons();
+        gui_draw_desktop_icons_ui();
         gui_draw_taskbar();
         gui_draw_start_menu();
         if (g_app_active && !g_app_minimized && !g_app_closed) gui_app_draw_frame();
         if (!g_terminal_minimized && !g_terminal_closed) gui_draw_window_frame();
         gui_apply_console_viewport(redraw_console);
+        gui_draw_desktop_context_menu();
         // Re-draw cursor on top of UI.
         g_cursor_saved_valid = 0;
         gui_cursor_draw_at(g_mouse_x_px, g_mouse_y_px);
@@ -864,6 +996,7 @@ void gui_mouse_push_byte(uint8_t byte) {
         uint8_t dy_mag = g_mouse_packet[2];
 
         int left = (b0 & 0x01) ? 1 : 0;
+        int right = (b0 & 0x02) ? 1 : 0;
 
         // PS/2 motion bytes are signed (two's complement). Sign bits in b0 mirror this.
         int dx = (int)(signed char)dx_mag;
@@ -885,12 +1018,41 @@ void gui_mouse_push_byte(uint8_t byte) {
 
         g_mouse_left_prev = g_mouse_left;
         g_mouse_left = left;
+        g_mouse_right_prev = g_mouse_right;
+        g_mouse_right = right;
 
         int left_pressed = (g_mouse_left == 1 && g_mouse_left_prev == 0);
         int left_released = (g_mouse_left == 0 && g_mouse_left_prev == 1);
+        int right_pressed = (g_mouse_right == 1 && g_mouse_right_prev == 0);
+        int right_released = (g_mouse_right == 0 && g_mouse_right_prev == 1);
         // Latches are for app client-area clicks only (set below after hit-testing).
         if (left_pressed) g_mouse_left_pressed_latch = 0;
         if (left_released) g_mouse_left_released_latch = 0;
+
+        if (right_pressed) {
+            // Check if right clicked on desktop
+            int taskbar_h_px = g_taskbar_rows_chars * CHAR_HEIGHT;
+            int taskbar_y_px = (int)fb_root.height - taskbar_h_px;
+            if (g_mouse_y_px < taskbar_y_px) {
+                // simple bounds check to ensure it's not on a window
+                int on_window = 0;
+                if (g_app_active && !g_app_minimized && !g_app_closed && gui_app_outer_contains(g_mouse_x_px, g_mouse_y_px)) on_window = 1;
+                if (!g_terminal_minimized && !g_terminal_closed) {
+                    int outer_x_px = g_win_left * CHAR_WIDTH;
+                    int outer_y_px = g_win_top * CHAR_HEIGHT;
+                    int outer_w_px = g_win_cols * CHAR_WIDTH;
+                    int outer_h_px = g_win_rows * CHAR_HEIGHT;
+                    if (rect_contains(g_mouse_x_px, g_mouse_y_px, outer_x_px, outer_y_px, outer_w_px, outer_h_px)) on_window = 1;
+                }
+                if (!on_window) {
+                    g_desktop_context_menu_open = 1;
+                    g_desktop_context_menu_x = g_mouse_x_px;
+                    g_desktop_context_menu_y = g_mouse_y_px;
+                    gui_draw_desktop(1);
+                    return;
+                }
+            }
+        }
 
         if (left_pressed) {
             // Taskbar hit-test.
@@ -1015,6 +1177,59 @@ void gui_mouse_push_byte(uint8_t byte) {
 
             // 2) Terminal window interactions
             gui_window_title_click_or_drag();
+
+            // Desktop Context Menu Click
+            if (g_desktop_context_menu_open) {
+                int menu_w = 140;
+                int menu_h = 64;
+                if (rect_contains(g_mouse_x_px, g_mouse_y_px, g_desktop_context_menu_x, g_desktop_context_menu_y, menu_w, menu_h)) {
+                    if (g_mouse_y_px < g_desktop_context_menu_y + 32) {
+                        os_api.launch_app("files");
+                    } else {
+                        os_api.launch_app("edit");
+                    }
+                    g_desktop_context_menu_open = 0;
+                    gui_draw_desktop(1);
+                    return;
+                } else {
+                    g_desktop_context_menu_open = 0;
+                    gui_draw_desktop(1);
+                }
+            }
+
+            // Desktop Icons Click
+            for (int i = 0; i < g_desktop_icon_count; i++) {
+                desktop_icon_t *icon = &g_desktop_icons[i];
+                if (rect_contains(g_mouse_x_px, g_mouse_y_px, icon->x, icon->y, icon->w, icon->h)) {
+                    char full_path[256];
+                    int k = 0;
+                    while (g_desktop_path[k] && k < 250) { full_path[k] = g_desktop_path[k]; k++; }
+                    full_path[k++] = '/';
+                    int n = 0;
+                    while (icon->name[n] && k < 255) { full_path[k++] = icon->name[n++]; }
+                    full_path[k] = '\0';
+
+                    if (icon->is_dir) {
+                        shell_set_launch_flags(MLJOS_LAUNCH_GUI);
+                        os_api.launch_app_args("files", full_path);
+                        shell_set_launch_flags(0);
+                    } else {
+                        int len = 0; while(icon->name[len]) len++;
+                        if (len >= 4 && icon->name[len-4] == '.' && icon->name[len-3] == 'a' && icon->name[len-2] == 'p' && icon->name[len-1] == 'p') {
+                            shell_set_launch_flags(MLJOS_LAUNCH_GUI);
+                            os_api.launch_app(full_path);
+                            shell_set_launch_flags(0);
+                        } else {
+                            shell_set_launch_flags(MLJOS_LAUNCH_GUI);
+                            os_api.launch_app_args("edit", full_path);
+                            shell_set_launch_flags(0);
+                        }
+                    }
+                    g_desktop_context_menu_open = 0;
+                    gui_draw_desktop(1);
+                    return;
+                }
+            }
         }
 
         if (g_dragging) {

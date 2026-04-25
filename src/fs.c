@@ -24,6 +24,7 @@
 #include "apps/date_app.h"
 #include "apps/terminal_app.h"
 #include "apps/files_app.h"
+#include "apps/paint_app.h"
 #include "boot/limine_bootx64_efi.h"
 #include "assets/wallpaper_bmp.h"
 #include "assets/icon_calc_bmp.h"
@@ -537,6 +538,9 @@ void fs_init(void) {
 
     fs_node_t *files_node = fs_create_node(apps_dir ? apps_dir : fs_root, "files.app", FS_FILE, 0, 0, 0755);
     if (files_node) { files_node->size = files_app_size; files_node->content = (char*)files_app_data; }
+
+    fs_node_t *paint_node = fs_create_node(apps_dir ? apps_dir : fs_root, "paint.app", FS_FILE, 0, 0, 0755);
+    if (paint_node) { paint_node->size = paint_app_size; paint_node->content = (char*)paint_app_data; }
 
     // Wallpaper
     if (wallpaper_bmp_size > 0) {

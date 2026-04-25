@@ -3,6 +3,9 @@
 #include "shell.h"
 #include "task.h"
 #include "wm.h"
+#include "net.h"
+#include "cpu.h"
+#include "sound.h"
 
 struct multiboot_tag {
     uint32_t type;
@@ -33,9 +36,16 @@ void kernel_main(uintptr_t mbi) {
         tag = (struct multiboot_tag *)((uintptr_t)tag + ((tag->size + 7) & ~7));
     }
 
+    cpu_init();
+
     task_init();
     wm_init();
+    net_init();
     console_set_visible(NULL, 0);
+    
+    // Startup beep: 440Hz for 250ms
+    sound_beep(440, 250);
+
     shell_boot();
 
     // Main WM + cooperative scheduler loop.
@@ -49,6 +59,7 @@ void kernel_main(uintptr_t mbi) {
 
         wm_reap_closed_windows();
         wm_compose_if_dirty();
+        net_poll();
         task_schedule_once();
     }
 }

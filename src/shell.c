@@ -11,9 +11,11 @@
 #include "task.h"
 #include "ui.h"
 #include "usb.h"
+#include "net.h"
 #include "users.h"
 #include "wm.h"
 #include "sdk/mljos_app.h"
+#include "sound.h"
 
 static int app_read_file(const char *path, char *buf, int maxlen, unsigned int *size_out);
 static int app_write_file(const char *path, const char *buf, unsigned int size);
@@ -536,11 +538,28 @@ static void cmd_shutdown(void) {
     COLOR = COLOR_ALERT;
     puts("Shutdown...\n");
     COLOR = old_color;
-    outw(0x604, 0x2000);
+
+    // Try various shutdown ports
+    outw(0x604, 0x2000);  // QEMU
+    outw(0xB004, 0x2000); // Bochs / Old QEMU
+    outw(0x4004, 0x3400); // VirtualBox / VMWare
+
+    // Fallback: Keyboard controller reset (will reboot instead of shutdown if above fails)
+    puts("Shutdown failed, attempting reboot fallback...\n");
     outb(0x64, 0xFE);
+
     for (;;) {
         __asm__ volatile ("hlt");
     }
+}
+
+static void cmd_ping(char **argv, int argc) {
+    if (argc < 2) {
+        puts("ping: missing destination IP\n");
+        return;
+    }
+    uint32_t ip = net_parse_ip(argv[1]);
+    net_ping(ip);
 }
 
 static void push_history(const char *line) {
@@ -1444,6 +1463,8 @@ static void handle_command(char *line) {
         cmd_resolution(argv, argc);
     } else if (strcmp(argv[0], "shutdown") == 0) {
         cmd_shutdown();
+    } else if (strcmp(argv[0], "ping") == 0) {
+        cmd_ping(argv, argc);
     } else if (strcmp(argv[0], "clear") == 0) {
         shell_exec_app_command("clear");
     } else if (strcmp(argv[0], "login") == 0 || strcmp(argv[0], "logout") == 0) {
@@ -1674,6 +1695,7 @@ static void handle_command(char *line) {
         puts("Unknown command: ");
         puts(argv[0]);
         putchar('\n');
+        sound_beep(200, 50);
         COLOR = COLOR_DEFAULT;
     }
 

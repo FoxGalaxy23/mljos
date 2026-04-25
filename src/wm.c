@@ -2199,3 +2199,23 @@ void wm_reap_closed_windows(void) {
         }
     }
 }
+
+void wm_on_task_exit(task_t *t) {
+    if (!t) return;
+    for (int i = 0; i < WM_MAX_WINDOWS; ++i) {
+        wm_window_t *w = &g_windows[i];
+        if (!w->used) continue;
+        if (w->owner == t) {
+            w->close_requested = 1;
+        }
+        // Also check terminal tabs
+        for (int j = 0; j < (int)w->terminal_tab_count; ++j) {
+            if (w->terminal_tabs[j] == t) {
+                w->terminal_tabs[j] = NULL;
+                // If this was the active tab, we might need to switch or close window
+                if (window_all_terminal_tabs_dead(w)) w->close_requested = 1;
+            }
+        }
+    }
+}
+

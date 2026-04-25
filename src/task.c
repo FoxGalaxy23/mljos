@@ -3,6 +3,7 @@
 #include "app_layout.h"
 #include "kmem.h"
 #include "sdk/mljos_app.h"
+#include "wm.h"
 
 #define MAX_TASKS 16
 #define TASK_STACK_SIZE (64 * 1024)
@@ -232,9 +233,14 @@ void task_yield(void) {
 }
 
 __attribute__((noreturn)) void task_exit(void) {
-    if (g_current) g_current->state = TASK_DEAD;
+    if (g_current) {
+        g_current->state = TASK_DEAD;
+        wm_on_task_exit(g_current);
+    }
     // Switch back to kernel.
-    ctx_switch(&g_current->ctx, &g_kernel_ctx);
+    if (g_current) {
+        ctx_switch(&g_current->ctx, &g_kernel_ctx);
+    }
     for (;;) { }
 }
 
